@@ -21,6 +21,7 @@ from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
@@ -253,6 +254,27 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def half_precision_output_kwargs(model_module) -> dict:
+    """Keyword arguments that stop ``Float16Module`` upcasting the model output to fp32.
+
+    ``Float16Module`` upcasts the last pipeline stage's output by default, which for a language
+    model means a second copy of the whole ``[T, V]`` logit tensor. Everything downstream of the
+    log-prob pass upcasts the slice it actually reads -- ``calculate_log_probs_and_entropy``
+    copies each response chunk to fp32, and the fused vocab-parallel cross entropy starts with a
+    cast -- and at long context those slices are a small fraction of ``T``. Megatron's own RL
+    path selects the flag the same way, see ``megatron/rl/rl_utils.py``.
+
+    Returns an empty dict when the model is not wrapped, since a bare ``GPTModel`` does not
+    accept the argument.
+    """
+    module = model_module
+    while module is not None:
+        if isinstance(module, Float16Module):
+            return {"fp32_output": False}
+        module = getattr(module, "module", None)
+    return {}
+
+
 @torch.no_grad()
 def forward_only(
     f: Callable[..., dict[str, list[torch.Tensor]]],
@@ -343,6 +365,7 @@ def forward_only(
             labels=None,
             packed_seq_params=packed_seq_params,
             loss_mask=batch["full_loss_masks"],
+            **half_precision_output_kwargs(model),
             **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
         )
