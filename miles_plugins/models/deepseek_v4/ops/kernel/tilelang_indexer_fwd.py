@@ -4,9 +4,13 @@
 #   - Operates on [seqlen, batch, heads, dim] (SBHD) layout, batch handled externally
 #   - Uses causal mask via cu_seqlens instead of variable-length packed sequences
 #   - Supports compressed KV (seq_len_kv = seq_len_q / compress_ratio)
+import logging
+
 import tilelang
 import torch
 from tilelang import language as T
+
+logger = logging.getLogger(__name__)
 
 
 @tilelang.jit(
@@ -133,6 +137,42 @@ def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device):
     return cu_seqlen_ks, cu_seqlen_ke
 
 
+# Matched against tilelang's own error text; see the note in tilelang_sparse_mla_bwd.py.
+_SHARED_MEM_ERROR = "exceeds device limit"
+_fitted_block_N: dict[tuple, int] = {}
+
+
+def _indexer_fwd_within_shared_mem(heads, index_dim, block_N=256):
+    """Build tl_indexer_fwd_impl, halving block_N until its shared memory fits this GPU.
+
+    index_k_shared is [block_N, index_dim] bf16 and index_q_shared is [block_Q*heads, index_dim];
+    at the tuned block_N=256 that asks for 96 KiB, which fits gfx950's 160 KiB LDS but not the 64 KiB
+    of gfx942 (MI300/MI308). block_N only sets how much of the KV axis one workgroup sweeps per
+    iteration, so halving it costs performance, not correctness. Memoized per shape.
+    """
+    key = (heads, index_dim, block_N)
+    if key in _fitted_block_N:
+        return tl_indexer_fwd_impl(heads=heads, index_dim=index_dim, block_N=_fitted_block_N[key])
+
+    fitted = block_N
+    while True:
+        try:
+            kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim, block_N=fitted)
+        except RuntimeError as e:
+            if _SHARED_MEM_ERROR not in str(e) or fitted <= 32:
+                raise
+            fitted //= 2
+            continue
+        _fitted_block_N[key] = fitted
+        if fitted != block_N:
+            logger.warning(
+                "[tl_indexer_fwd] shared memory forced block_N=%s on this GPU (requested %s)",
+                fitted,
+                block_N,
+            )
+        return kernel
+
+
 def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True):
     """Forward interface matching GLM-5's API but for a single batch element.
 
@@ -150,7 +190,7 @@ def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logi
     seq_len_kv = kv.shape[0]
 
     clean_logits_kernel = clean_logits_()
-    tl_indexer_fwd_kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim)
+    tl_indexer_fwd_kernel = _indexer_fwd_within_shared_mem(heads=heads, index_dim=index_dim)
 
     logits = torch.empty([seq_len, seq_len_kv], device=q.device, dtype=torch.float32)
     tl_indexer_fwd_kernel(
