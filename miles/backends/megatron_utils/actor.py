@@ -346,7 +346,7 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> dict[str, list[torch.Tensor]]:
 
         with timer(f"{store_prefix}log_probs"):
-            return forward_only(
+            log_probs = forward_only(
                 get_log_probs_and_entropy,
                 self.args,
                 self.model,
@@ -355,6 +355,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_id=rollout_id,
                 store_prefix=store_prefix,
             )
+        # The last microbatch's activations are still held by the cycles forward_only collects per
+        # microbatch, and the training step that follows is the memory peak of the rollout. Release
+        # them before it starts rather than whenever the next pass happens to collect.
+        clear_memory()
+        return log_probs
 
     @with_logs
     @event_logger_context(
