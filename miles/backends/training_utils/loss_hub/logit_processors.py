@@ -52,13 +52,21 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    if logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0:
-        logits = logits.div(args.rollout_temperature)
+    # Both of these used to run on the whole [T, V] tensor, each allocating a second copy of it --
+    # 3.9 GiB per copy at T=16384 over a 129280-entry vocabulary. Only the response rows are ever
+    # read, and at 128K context those are a few percent of T. Elementwise division and a dtype cast
+    # both commute with slicing, so deferring them to the chunk is exact.
+    temperature = (
+        args.rollout_temperature
+        if (logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0)
+        else None
+    )
+    chunk_dtype = None
     if args.true_on_policy_mode:
         if getattr(args, "bf16", False):
-            logits = logits.to(torch.bfloat16)
+            chunk_dtype = torch.bfloat16
         elif getattr(args, "fp16", False):
-            logits = logits.to(torch.float16)
+            chunk_dtype = torch.float16
 
     parallel_state = get_parallel_state()
     cp_size = parallel_state.cp.size
@@ -124,6 +132,11 @@ def get_responses(
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
 
         seq_start += total_length
+
+        if temperature is not None:
+            logits_chunk = logits_chunk.div(temperature)
+        if chunk_dtype is not None:
+            logits_chunk = logits_chunk.to(chunk_dtype)
 
         yield logits_chunk, tokens_chunk
 
