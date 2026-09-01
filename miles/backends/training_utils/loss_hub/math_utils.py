@@ -984,9 +984,15 @@ def calculate_log_probs_and_entropy(
             if with_entropy:
                 entropy = compute_entropy(logits)
     else:
-        log_prob = logits.new_zeros((0,))
+        # compute_log_probs and compute_entropy both upcast their input, so every branch above
+        # returns fp32 whatever the logits dtype is. This one has to match: with bf16 logits it
+        # would otherwise return bf16, and under context parallelism a rank whose slice holds no
+        # response token takes this branch while the others do not. They then meet in one
+        # all-reduce over the concatenated response tensors, disagreeing on byte count. That is a
+        # hang, not an error -- the collective never completes and the job dies to the watchdog.
+        log_prob = logits.new_zeros((0,), dtype=torch.float32)
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = logits.new_zeros((0,), dtype=torch.float32)
 
     return log_prob, entropy
 
