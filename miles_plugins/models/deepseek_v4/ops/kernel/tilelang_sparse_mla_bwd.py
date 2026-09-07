@@ -5,13 +5,22 @@
 #   - Single-head KV: kv shape [B, S_kv, D] (no kv_group, no D/D_tail split)
 #   - Index shape: [B, S, topk] (no kv_group dim)
 #   - Outputs: dQ [B, S, H, D], dKV [B, S_kv, D], dAttnSink [H]
-import logging
-
 import tilelang
 import torch
 from tilelang import language as T
 
-logger = logging.getLogger(__name__)
+from miles_plugins.models.deepseek_v4.ops.kernel.tiling import (
+    RETRYABLE_BUILD_ERRORS,
+    BackwardTiling,
+    DeviceLimits,
+    build_with_largest_fitting_tiling,
+    current_target,
+    shared_memory_required,
+    sparse_mla_backward_tilings,
+)
+
+# Re-exported: tilelang_sparse_mla.py probes buildability through this name.
+__all__ = ["RETRYABLE_BUILD_ERRORS", "bwd", "bwd_within_shared_mem", "sparse_mqa_bwd_interface"]
 
 
 @tilelang.jit(out_idx=[-1])
@@ -254,45 +263,17 @@ def bwd(
     return sparse_mqa_bwd_kernel
 
 
-# tilelang rejects an unbuildable tiling in three different places -- the shared-memory check at
-# codegen, warp partitioning inside T.gemm, and the vectorizer on the atomic store loop -- so all
-# three have to be treated as "try the next candidate" rather than as a hard error.
-# Matched against tilelang's own error text, so these are coupled to the tilelang version. If an
-# upgrade reworded any of them the retry below would stop firing and the failure would surface as a
-# hard error. tests/fast/test_dsv4_tiling_fallback.py asserts they are still what tilelang emits.
-RETRYABLE_BUILD_ERRORS = ("exceeds device limit", "Divide by zero", "is_scalar")
-
-# (block_size, threads, split_store, stage_dq_through_shared, max_block_H), in decreasing order of
-# expected performance. The first entry is the shipped tiling, sized for gfx950's 160 KiB LDS.
-#
-# The second is the only one that builds on gfx942's 64 KiB, and every part of it is forced:
-#   - block_size and max_block_H both at 16, because Q_shared/dO_shared [block_H, D] and KV_shared
-#     [block_size, D] are 16 KiB each at D=512 and three of them is already 48 KiB;
-#   - stage_dq_through_shared off, because dQ_shared is a fourth [block_H, D] buffer and 64 KiB does
-#     not hold four of them plus the accumulators;
-#   - threads=64, because a 16x16 gemm output cannot be split across two wave64s under
-#     GemmWarpPolicy.FullCol (N=8 is below MFMA's 16 and tilelang divides by zero);
-#   - split_store == block_size, because at threads=64 anything wider than a single row in
-#     acc_dkv_shared makes the atomic_addx4 store loop fail tilelang's vectorization pass.
-# Total shared memory is 52224 B, 80% of the limit. Costs: one head and one KV slot per tile
-# instead of 32, a single wave per workgroup, and 16 separate atomic store passes per KV block.
-_FALLBACK_TILINGS = (
-    (32, 128, 2, True, None),
-    (16, 64, 16, False, 16),
-)
-_fitted_tiling: dict[tuple, tuple] = {}
+_fitted_tiling: dict[tuple, BackwardTiling] = {}
 
 
-def bwd_within_shared_mem(B, S, S_kv, H, D, topk, sm_scale=None):
-    """Build the backward kernel with the best tiling this GPU can host.
+def bwd_within_shared_mem(B, S, S_kv, H, D, topk, sm_scale=None, block_size=32, threads=128):
+    """Build the backward kernel with the largest tiling this target can host.
 
-    Which tiling fits is not worth predicting: tilelang merges and pads shared buffers, and two of
-    the three failure modes are not about size at all. The only reliable check is asking it to
-    build. Memoized per shape, so the cost is at most one wasted compile per shape.
+    Same shape as the forward search: compile what was asked for, and only if that is refused ask
+    tilelang what the alternatives need. Memoized per shape.
     """
-    key = (B, S, S_kv, H, D, topk, sm_scale)
-    if key in _fitted_tiling:
-        block_size, threads, split_store, stage_dq, max_block_H = _fitted_tiling[key]
+
+    def build(tiling):
         return bwd(
             B,
             S,
@@ -301,64 +282,58 @@ def bwd_within_shared_mem(B, S, S_kv, H, D, topk, sm_scale=None):
             D,
             topk,
             sm_scale,
-            block_size=block_size,
-            threads=threads,
-            split_store=split_store,
-            stage_dq_through_shared=stage_dq,
-            max_block_H=max_block_H,
+            block_size=tiling.block_size,
+            threads=tiling.threads,
+            split_store=tiling.split_store,
+            stage_dq_through_shared=tiling.stage_dq_through_shared,
+            max_block_H=tiling.max_block_H,
         )
 
-    # `.with_traceback(None)` is not cosmetic: an exception carried out of its `except` block keeps
-    # the frame chain of every caller alive, which here means the model forward's activations, in a
-    # cycle only the cyclic collector can break. Only the message survives, which is all
-    # `raise last_error` needs.
-    last_error = None
-    for candidate in _FALLBACK_TILINGS:
-        block_size, threads, split_store, stage_dq, max_block_H = candidate
-        if topk % block_size != 0:
-            continue
-        try:
-            kernel = bwd(
-                B,
-                S,
-                S_kv,
-                H,
-                D,
-                topk,
-                sm_scale,
-                block_size=block_size,
-                threads=threads,
-                split_store=split_store,
-                stage_dq_through_shared=stage_dq,
-                max_block_H=max_block_H,
-            )
-        except Exception as e:  # tilelang raises RuntimeError or tvm InternalError
-            if not any(marker in str(e) for marker in RETRYABLE_BUILD_ERRORS):
-                raise
-            last_error = e.with_traceback(None)
-            continue
-        _fitted_tiling[key] = candidate
-        if candidate is not _FALLBACK_TILINGS[0]:
-            logger.warning(
-                "[sparse_mqa_bwd] shared memory forced a smaller tiling on this GPU: "
-                "block_size=%s threads=%s split_store=%s stage_dq_through_shared=%s max_block_H=%s",
-                block_size,
-                threads,
-                split_store,
-                stage_dq,
-                max_block_H,
-            )
-        return kernel
-    if last_error is None:
-        # Every candidate was skipped as inapplicable, so there is nothing to re-raise. `raise None`
-        # would surface as "TypeError: exceptions must derive from BaseException", which says
-        # nothing about the shape that caused it. Reachable through this function directly, since
-        # sparse_mqa_bwd_interface pads topk to a multiple of 32 but callers need not.
-        raise ValueError(
-            f"no candidate tiling divides topk={topk}; block sizes offered were "
-            f"{sorted({c[0] for c in _FALLBACK_TILINGS})}"
+    key = (B, S, S_kv, H, D, topk, sm_scale)
+    if key in _fitted_tiling:
+        return build(_fitted_tiling[key])
+
+    requested = BackwardTiling(block_size, threads, split_store=2, stage_dq_through_shared=True, max_block_H=None)
+    target = current_target()
+    limits = DeviceLimits.from_target(target)
+
+    def required_bytes(tiling):
+        prim_func = bwd.get_tir(
+            B,
+            S,
+            S_kv,
+            H,
+            D,
+            topk,
+            sm_scale,
+            block_size=tiling.block_size,
+            threads=tiling.threads,
+            split_store=tiling.split_store,
+            stage_dq_through_shared=tiling.stage_dq_through_shared,
+            max_block_H=tiling.max_block_H,
         )
-    raise last_error
+        return shared_memory_required(prim_func, target)
+
+    kernel, tiling = build_with_largest_fitting_tiling(
+        requested=requested,
+        derived=(
+            candidate
+            for candidate in sparse_mla_backward_tilings(
+                padded_heads=max(tilelang.math.next_power_of_2(H), 16),
+                topk=topk,
+                block_size=block_size,
+                limits=limits,
+            )
+            if candidate != requested
+        ),
+        compile_tiling=build,
+        required_bytes=required_bytes,
+        budget=limits.shared_memory_per_block,
+        describe=lambda t: t.describe(),
+        what="sparse_mqa_bwd",
+    )
+    _fitted_tiling[key] = tiling
+    return kernel
 
 
 def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=None):

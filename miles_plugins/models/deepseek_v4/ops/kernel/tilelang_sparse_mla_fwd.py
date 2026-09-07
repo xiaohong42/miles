@@ -5,13 +5,18 @@
 #   - Single-head KV: kv shape [B, S_kv, D] (no kv_group, no D/D_tail split)
 #   - Index shape: [B, S, topk] (no kv_group dim)
 #   - Output: [B, S, H, D] + LSE [B, S, H]
-import logging
-
 import tilelang
 import torch
 from tilelang import language as T
 
-logger = logging.getLogger(__name__)
+from miles_plugins.models.deepseek_v4.ops.kernel.tiling import (
+    DeviceLimits,
+    ForwardTiling,
+    build_with_largest_fitting_tiling,
+    current_target,
+    shared_memory_required,
+    sparse_mla_forward_tilings,
+)
 
 
 @tilelang.jit(
@@ -177,97 +182,72 @@ _SHARED_MEM_ERROR = "exceeds device limit"
 # inapplicable rather than a caller error. Its sibling asserts (dim not a power of two, topk not
 # divisible by block_I) are caller errors and must not be retried.
 _BLOCK_H_ASSERT = "block_H"
-# (num_stages, block_I, threads, block_H), in decreasing order of expected performance, tried when
-# the requested tiling does not build on this GPU. block_H=None means "one block of padded_H", the
-# pre-existing behaviour.
-#
-# The default tiling is sized for a 160 KiB LDS (gfx950). gfx942 (MI300/MI308) has 64 KiB per
-# workgroup, where KV_shared alone (block_I*dim*2 bytes per pipeline stage) is the whole budget at
-# block_I=64 and dim=512. Shrinking block_I in turn needs fewer threads, or tilelang's warp
-# partitioning degenerates into a divide-by-zero.
-#
-# The first four entries keep block_H=None and are tried first, so a GPU whose shared memory fits
-# the shipped tiling compiles exactly what it compiled before -- the requested tiling is candidate
-# #0 and none of this is reached. That is the only claim being made here: on gfx942 itself NO head
-# count builds with the shipped tiling, because at 32 or fewer local heads H_per_block != 64 and
-# the HIP branch above stops clamping num_stages to 1, which costs more shared memory than the 64-
-# head case (172032 B at 32 heads against 141312 B at 64). CP=4/TP=2 therefore also lands on a
-# fallback, at (1, 16, 64, None).
-#
-# The block_H entries exist for 64-head models on a 64 KiB-LDS GPU, where no block_H=None tiling
-# fits. Requirements below are what tilelang reports for the lowered kernel, not an estimate:
-#   block_H=32, block_I=16 -> 51184 B
-#   block_H=16, block_I=32 -> 51200 B
-#   block_H=16, block_I=16 -> 34032 B
-_FALLBACK_TILINGS = (
-    (1, 64, 256, None),
-    (1, 32, 128, None),
-    (1, 32, 64, None),
-    (1, 16, 64, None),
-    (1, 16, 64, 32),
-    (1, 32, 128, 16),
-    (1, 16, 64, 16),
-)
-_fitted_tiling: dict[tuple, tuple] = {}
+_fitted_tiling: dict[tuple, ForwardTiling] = {}
 
 
 def _compile_within_shared_mem(heads, dim, topk, sm_scale, block_I, num_stages, threads):
-    """Compile sparse_mqa_fwd, shrinking the tiling if the GPU cannot host its shared memory.
+    """Compile sparse_mqa_fwd with the largest tiling this target can host.
 
-    Which tiling fits is not worth predicting: tilelang reuses and pads shared buffers, so the only
-    reliable check is asking it to build the kernel. The result is memoized per shape.
+    The requested tiling is compiled optimistically, so a GPU whose shared memory fits it pays
+    nothing for this path. Only once it has been refused are alternatives derived, and then
+    tilelang is asked what each one needs rather than being made to compile it.
 
-    Candidates are (num_stages, block_I, threads, block_H). block_H shrinks the head block, which is
-    the only thing that helps a 64-head model on a 64 KiB-LDS GPU -- Q_shared alone is [64, 512] bf16
-    = 65536 B there, and num_stages only multiplies KV_shared.
+    Memoized per shape, so the search happens at most once per shape and only where it is needed.
     """
-    key = (heads, dim, topk, sm_scale, block_I, num_stages, threads)
-    candidates = [_fitted_tiling[key]] if key in _fitted_tiling else [(num_stages, block_I, threads, None)]
-    candidates += [c for c in _FALLBACK_TILINGS if c not in candidates and topk % c[1] == 0]
 
-    # Carrying a rejected candidate's exception out of its `except` block keeps its __traceback__,
-    # and through the frame chain every local of every caller -- here the whole model forward, whose
-    # locals are activation tensors. The reference cycle that forms is only breakable by the cyclic
-    # collector, so those activations sit on the device until something triggers a full gc pass.
-    # Strip the traceback: the message is all `raise last_error` needs.
-    last_error = None
-    for stages, bi, thr, bh in candidates:
-        try:
-            kernel = sparse_mqa_fwd(heads, dim, topk, sm_scale, block_I=bi, num_stages=stages, threads=thr, block_H=bh)
-        except RuntimeError as e:
-            if _SHARED_MEM_ERROR not in str(e):
-                raise
-            last_error = e.with_traceback(None)
-            continue
-        except AssertionError as e:
-            # Only the block_H assert means "this candidate does not apply". Anything else --
-            # a dim that is not a power of two, a topk that does not divide block_I -- is the
-            # caller's mistake, and retrying it seven times would bury that.
-            if _BLOCK_H_ASSERT not in str(e):
-                raise
-            last_error = e.with_traceback(None)
-            continue
-        except Exception as e:  # tilelang raises tvm InternalError for an unsupported tile shape
-            if "Divide by zero" not in str(e):
-                raise
-            last_error = e.with_traceback(None)
-            continue
-        if key not in _fitted_tiling:
-            _fitted_tiling[key] = (stages, bi, thr, bh)
-            if (stages, bi, thr, bh) != (num_stages, block_I, threads, None):
-                logger.warning(
-                    "[sparse_mqa_fwd] shared memory forced a smaller tiling on this GPU: "
-                    "num_stages=%s block_I=%s threads=%s block_H=%s (requested %s/%s/%s/None)",
-                    stages,
-                    bi,
-                    thr,
-                    bh,
-                    num_stages,
-                    block_I,
-                    threads,
-                )
-        return kernel
-    raise last_error
+    def build(tiling):
+        return sparse_mqa_fwd(
+            heads,
+            dim,
+            topk,
+            sm_scale,
+            block_I=tiling.block_I,
+            num_stages=tiling.num_stages,
+            threads=tiling.threads,
+            block_H=tiling.block_H,
+        )
+
+    key = (heads, dim, topk, sm_scale, block_I, num_stages, threads)
+    if key in _fitted_tiling:
+        return build(_fitted_tiling[key])
+
+    requested = ForwardTiling(num_stages, block_I, threads, None)
+    target = current_target()
+    limits = DeviceLimits.from_target(target)
+
+    def required_bytes(tiling):
+        prim_func = sparse_mqa_fwd.get_tir(
+            heads,
+            dim,
+            topk,
+            sm_scale,
+            block_I=tiling.block_I,
+            num_stages=tiling.num_stages,
+            threads=tiling.threads,
+            block_H=tiling.block_H,
+        )
+        return shared_memory_required(prim_func, target)
+
+    kernel, tiling = build_with_largest_fitting_tiling(
+        requested=requested,
+        derived=(
+            candidate
+            for candidate in sparse_mla_forward_tilings(
+                padded_heads=max(tilelang.math.next_power_of_2(heads), 16),
+                topk=topk,
+                block_I=block_I,
+                limits=limits,
+            )
+            if candidate != requested
+        ),
+        compile_tiling=build,
+        required_bytes=required_bytes,
+        budget=limits.shared_memory_per_block,
+        describe=lambda t: t.describe(),
+        what="sparse_mqa_fwd",
+    )
+    _fitted_tiling[key] = tiling
+    return kernel
 
 
 def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=2, threads=256):
