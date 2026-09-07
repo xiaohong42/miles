@@ -8,6 +8,8 @@ returned untouched when it builds. That is what makes this change inert on a GPU
 already fits the shipped tilings -- every later candidate is unreachable there.
 """
 
+import inspect
+
 import pytest
 
 tilelang = pytest.importorskip("tilelang", reason="the DeepSeek-V4 kernels are tilelang modules")
@@ -177,6 +179,15 @@ def test_backward_does_not_retry_an_undeclared_error(monkeypatch):
     assert len(calls) == 1
 
 
+def test_backward_says_so_when_no_candidate_divides_topk(monkeypatch):
+    """`raise last_error` with nothing to raise gives a TypeError about exception types instead."""
+    calls = _record_calls(monkeypatch, sparse_mla_bwd, "bwd", [])
+
+    with pytest.raises(ValueError, match="no candidate tiling divides topk=8"):
+        sparse_mla_bwd.bwd_within_shared_mem(**{**BWD_SHAPE, "topk": 8})
+    assert calls == [], "a shape no candidate applies to must not reach the builder"
+
+
 def test_backward_memoizes_per_shape(monkeypatch):
     calls = _record_calls(monkeypatch, sparse_mla_bwd, "bwd", [SHARED_MEM_ERROR, "smaller", "smaller"])
 
@@ -242,9 +253,27 @@ def test_the_shared_memory_marker_is_shared_by_every_entry_point():
 def test_the_shared_memory_marker_still_matches_what_tilelang_emits():
     """A canary for a tilelang upgrade that reworded the error the retry loops key on.
 
-    Only the wording is checked, not a real build: constructing a kernel that overflows shared
-    memory needs a GPU. If this ever fails, the retry loops have silently stopped firing.
-    """
-    from tilelang import engine  # noqa: F401  -- import so a rename breaks here rather than silently
+    tilelang has no structured exception for an unbuildable tiling; it formats this text into a
+    generated C++ guard in tilelang.jit.adapter.wrapper. Comparing the marker against that source
+    is what makes this a canary -- comparing it against a literal here would only restate the
+    constant and could never fail for the reason above.
 
-    assert sparse_mla_fwd._SHARED_MEM_ERROR == "exceeds device limit"
+    If this fails, every retry loop has silently stopped firing and a tiling that does not fit
+    surfaces as a hard error again.
+    """
+    from tilelang.jit.adapter import wrapper
+
+    assert sparse_mla_fwd._SHARED_MEM_ERROR in inspect.getsource(wrapper)
+
+
+def test_the_other_two_markers_have_no_python_source_to_check():
+    """Said out loud so the canary above is not mistaken for covering all three.
+
+    "Divide by zero" and "is_scalar" come from tilelang's C++ passes (src/transform/), so there is
+    nothing importable to compare them against. A tilelang upgrade that reworded either would be
+    caught only by a build failing on a device that needs the fallback.
+    """
+    assert set(sparse_mla_bwd.RETRYABLE_BUILD_ERRORS) - {sparse_mla_fwd._SHARED_MEM_ERROR} == {
+        "Divide by zero",
+        "is_scalar",
+    }
