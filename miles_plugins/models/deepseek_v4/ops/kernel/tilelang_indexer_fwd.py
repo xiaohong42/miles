@@ -4,13 +4,17 @@
 #   - Operates on [seqlen, batch, heads, dim] (SBHD) layout, batch handled externally
 #   - Uses causal mask via cu_seqlens instead of variable-length packed sequences
 #   - Supports compressed KV (seq_len_kv = seq_len_q / compress_ratio)
-import logging
-
 import tilelang
 import torch
 from tilelang import language as T
 
-logger = logging.getLogger(__name__)
+from miles_plugins.models.deepseek_v4.ops.kernel.tiling import (
+    DeviceLimits,
+    build_with_largest_fitting_tiling,
+    current_target,
+    indexer_forward_block_ns,
+    shared_memory_required,
+)
 
 
 @tilelang.jit(
@@ -137,40 +141,38 @@ def _make_causal_cu_seqlens(seq_len_q, seq_len_kv, compress_ratio, device):
     return cu_seqlen_ks, cu_seqlen_ke
 
 
-# Matched against tilelang's own error text; see the note in tilelang_sparse_mla_bwd.py.
-_SHARED_MEM_ERROR = "exceeds device limit"
 _fitted_block_N: dict[tuple, int] = {}
 
 
 def _indexer_fwd_within_shared_mem(heads, index_dim, block_N=256):
-    """Build tl_indexer_fwd_impl, halving block_N until its shared memory fits this GPU.
+    """Build tl_indexer_fwd_impl with the largest block_N this target can host.
 
-    index_k_shared is [block_N, index_dim] bf16 and index_q_shared is [block_Q*heads, index_dim];
-    at the tuned block_N=256 that asks for 96 KiB, which fits gfx950's 160 KiB LDS but not the 64 KiB
-    of gfx942 (MI300/MI308). block_N only sets how much of the KV axis one workgroup sweeps per
-    iteration, so halving it costs performance, not correctness. Memoized per shape.
+    block_N only sets how much of the KV axis one workgroup sweeps per iteration, so shrinking it
+    costs performance and nothing else. Memoized per shape.
     """
+
+    def build(n):
+        return tl_indexer_fwd_impl(heads=heads, index_dim=index_dim, block_N=n)
+
     key = (heads, index_dim, block_N)
     if key in _fitted_block_N:
-        return tl_indexer_fwd_impl(heads=heads, index_dim=index_dim, block_N=_fitted_block_N[key])
+        return build(_fitted_block_N[key])
 
-    fitted = block_N
-    while True:
-        try:
-            kernel = tl_indexer_fwd_impl(heads=heads, index_dim=index_dim, block_N=fitted)
-        except RuntimeError as e:
-            if _SHARED_MEM_ERROR not in str(e) or fitted <= 32:
-                raise
-            fitted //= 2
-            continue
-        _fitted_block_N[key] = fitted
-        if fitted != block_N:
-            logger.warning(
-                "[tl_indexer_fwd] shared memory forced block_N=%s on this GPU (requested %s)",
-                fitted,
-                block_N,
-            )
-        return kernel
+    target = current_target()
+    limits = DeviceLimits.from_target(target)
+    kernel, fitted = build_with_largest_fitting_tiling(
+        requested=block_N,
+        derived=indexer_forward_block_ns(block_N=block_N, limits=limits),
+        compile_tiling=build,
+        required_bytes=lambda n: shared_memory_required(
+            tl_indexer_fwd_impl.get_tir(heads=heads, index_dim=index_dim, block_N=n), target
+        ),
+        budget=limits.shared_memory_per_block,
+        describe=lambda n: f"block_N={n} (requested {block_N})",
+        what="tl_indexer_fwd",
+    )
+    _fitted_block_N[key] = fitted
+    return kernel
 
 
 def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True):
