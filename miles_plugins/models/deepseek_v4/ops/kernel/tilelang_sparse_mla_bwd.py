@@ -349,6 +349,15 @@ def bwd_within_shared_mem(B, S, S_kv, H, D, topk, sm_scale=None):
                 max_block_H,
             )
         return kernel
+    if last_error is None:
+        # Every candidate was skipped as inapplicable, so there is nothing to re-raise. `raise None`
+        # would surface as "TypeError: exceptions must derive from BaseException", which says
+        # nothing about the shape that caused it. Reachable through this function directly, since
+        # sparse_mqa_bwd_interface pads topk to a multiple of 32 but callers need not.
+        raise ValueError(
+            f"no candidate tiling divides topk={topk}; block sizes offered were "
+            f"{sorted({c[0] for c in _FALLBACK_TILINGS})}"
+        )
     raise last_error
 
 

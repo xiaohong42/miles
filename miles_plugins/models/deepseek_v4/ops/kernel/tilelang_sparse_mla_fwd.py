@@ -177,18 +177,28 @@ _SHARED_MEM_ERROR = "exceeds device limit"
 # inapplicable rather than a caller error. Its sibling asserts (dim not a power of two, topk not
 # divisible by block_I) are caller errors and must not be retried.
 _BLOCK_H_ASSERT = "block_H"
-# (num_stages, block_I, threads) in decreasing order of expected performance, tried when the
-# requested tiling does not build on this GPU. The default is sized for a 160 KiB LDS (gfx950);
-# gfx942 (MI300/MI308) has 64 KiB per workgroup, where KV_shared alone (block_I*dim*2 bytes per
-# pipeline stage) is the whole budget at block_I=64 and dim=512. Shrinking block_I in turn needs
-# fewer threads, or tilelang's warp partitioning degenerates into a divide-by-zero.
-# (num_stages, block_I, threads, block_H). block_H=None means "one block of padded_H", the
-# pre-existing behaviour. The first four entries are the original list and are tried first, so
-# nothing that used to build changes tiling. The block_H entries exist for 64-head models on a
-# 64 KiB-LDS GPU, where no block_H=None tiling can fit:
-#   block_H=32, block_I=16 -> Q 32768 + KV 16384 + S 1024 + Lse 128 = 50304 B
-#   block_H=16, block_I=32 -> Q 16384 + KV 32768 + S 1024 + Lse  64 = 50240 B
-#   block_H=16, block_I=16 -> Q 16384 + KV 16384 + S  512 + Lse  64 = 33344 B
+# (num_stages, block_I, threads, block_H), in decreasing order of expected performance, tried when
+# the requested tiling does not build on this GPU. block_H=None means "one block of padded_H", the
+# pre-existing behaviour.
+#
+# The default tiling is sized for a 160 KiB LDS (gfx950). gfx942 (MI300/MI308) has 64 KiB per
+# workgroup, where KV_shared alone (block_I*dim*2 bytes per pipeline stage) is the whole budget at
+# block_I=64 and dim=512. Shrinking block_I in turn needs fewer threads, or tilelang's warp
+# partitioning degenerates into a divide-by-zero.
+#
+# The first four entries keep block_H=None and are tried first, so a GPU whose shared memory fits
+# the shipped tiling compiles exactly what it compiled before -- the requested tiling is candidate
+# #0 and none of this is reached. That is the only claim being made here: on gfx942 itself NO head
+# count builds with the shipped tiling, because at 32 or fewer local heads H_per_block != 64 and
+# the HIP branch above stops clamping num_stages to 1, which costs more shared memory than the 64-
+# head case (172032 B at 32 heads against 141312 B at 64). CP=4/TP=2 therefore also lands on a
+# fallback, at (1, 16, 64, None).
+#
+# The block_H entries exist for 64-head models on a 64 KiB-LDS GPU, where no block_H=None tiling
+# fits. Requirements below are what tilelang reports for the lowered kernel, not an estimate:
+#   block_H=32, block_I=16 -> 51184 B
+#   block_H=16, block_I=32 -> 51200 B
+#   block_H=16, block_I=16 -> 34032 B
 _FALLBACK_TILINGS = (
     (1, 64, 256, None),
     (1, 32, 128, None),
