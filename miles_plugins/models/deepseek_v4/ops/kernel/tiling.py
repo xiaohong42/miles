@@ -340,6 +340,13 @@ def sparse_mla_backward_tilings(
     whole ``[block_H, D]`` buffer by writing dQ straight to global memory. Both are tried only
     after the tile sizes are already at their smallest, because both cost bandwidth rather than
     parallelism.
+
+    NOT YET RUN ON HARDWARE. Offering ``stage_dq=True`` first makes gfx942 select a different
+    backward kernel from the one the 8x MI308X run validated, which took ``stage_dq=False`` because
+    the hand-written list offered nothing else. The measurement behind the reordering is real --
+    tilelang reuses dQ_shared, so staging costs 480 B here rather than the 16 KiB the buffer
+    suggests, and the staged candidate fits at 52704 B of 65536 B -- but a tiling that fits is not
+    a tiling that has been shown to train. Until that run happens this ordering is a prediction.
     """
     for head_block in halvings(padded_heads, MIN_HEAD_BLOCK):
         for kv_block in halvings(block_size, limits.min_gemm_n_per_warp):
