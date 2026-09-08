@@ -51,8 +51,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# One warning per process, not per shape, when the requirement cannot be read.
-_warned_unreadable: set = set()
+# Entry points that have already reported an unreadable requirement. Keyed so each one says it
+# once -- the three kernels are compiled independently and a reader who only sees the forward's
+# warning would have no reason to think the indexer is doing the same thing.
+_warned_unreadable: set[str] = set()
 
 # The attribute tilelang leaves on the lowered device function. Named here so a tilelang rename
 # fails loudly in one place instead of being mistaken for "this tiling needs no shared memory".
@@ -236,21 +238,27 @@ def build_with_largest_fitting_tiling(
             # The requirement could not be read, so this candidate cannot be planned for. Fall back
             # to the older strategy for it -- attempt the compilation and let that be the answer.
             # Costs a build per candidate instead of a lowering, which is the price of not knowing.
-            if not _warned_unreadable:
+            if what not in _warned_unreadable:
                 logger.warning(
                     "[%s] tilelang did not report %s on the lowered kernel, so tilings are being "
                     "compiled to find out whether they fit. Check whether tilelang renamed it.",
                     what,
                     SHARED_MEMORY_ATTR,
                 )
-                _warned_unreadable.add(True)
+                _warned_unreadable.add(what)
             try:
                 kernel = compile_tiling(candidate)
             except Exception as exc:
                 if not is_retryable_build_error(exc):
                     raise
                 continue
-            logger.warning("[%s] shared memory forced a smaller tiling on this GPU: %s", what, describe(candidate))
+            # Deliberately not the message below: without the requirement there is nothing to
+            # attribute the rejection to, only the fact that this candidate is the first that built.
+            logger.warning(
+                "[%s] the requested tiling did not build; compiled the largest candidate that did: %s",
+                what,
+                describe(candidate),
+            )
             return kernel, candidate
         if required > budget:
             continue
