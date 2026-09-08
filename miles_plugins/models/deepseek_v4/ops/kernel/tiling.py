@@ -51,8 +51,15 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# One warning per process, not per shape, when the requirement cannot be read.
+_warned_unreadable: set = set()
+
 # The attribute tilelang leaves on the lowered device function. Named here so a tilelang rename
 # fails loudly in one place instead of being mistaken for "this tiling needs no shared memory".
+# tilelang sets it only on functions that use dynamic shared memory, so "absent" is ambiguous
+# between "this kernel needs none" and "tilelang renamed it". The reader below returns None for
+# both and the search treats that as "cannot plan for this candidate, fall back to compiling it",
+# which degrades to the try-and-retry strategy rather than concluding that everything fits.
 SHARED_MEMORY_ATTR = "dyn_shared_memory_buf"
 
 # ---------------------------------------------------------------------------------------------
@@ -144,12 +151,12 @@ def current_target() -> Any:
     return determine_target("auto", return_object=True)
 
 
-def shared_memory_required(prim_func: Any, target: Any) -> int:
+def shared_memory_required(prim_func: Any, target: Any) -> int | None:
     """How much dynamic shared memory tilelang's lowered kernel asks for, in bytes.
 
     Lowers without generating or compiling device code, so this is much cheaper than a build while
-    giving the exact figure the build would have checked. Zero when the kernel declares no dynamic
-    shared memory at all.
+    giving the exact figure the build would have checked. None when the figure is not there to be
+    read -- see SHARED_MEMORY_ATTR.
     """
     from tilelang import engine
 
@@ -158,21 +165,21 @@ def shared_memory_required(prim_func: Any, target: Any) -> int:
     return largest_declared_shared_memory(lowered)
 
 
-def largest_declared_shared_memory(lowered: Any) -> int:
+def largest_declared_shared_memory(lowered: Any) -> int | None:
     """Read the requirement off a lowered module. Separate so it is testable without a GPU.
 
-    Zero when no function declares any, which is a kernel that needs no dynamic shared memory
-    rather than a failure to find out.
+    None when no function declares the attribute at all. Returning 0 there would be the worst
+    possible answer: every candidate would look like it fits, the search would take the first and
+    largest, and its compilation would fail with the very shared-memory error this module exists to
+    route around -- silently undoing the fallback rather than reporting that it cannot plan.
     """
     device_mod = getattr(lowered, "device_mod", lowered)
-    return max(
-        (
-            int(func.attrs[SHARED_MEMORY_ATTR])
-            for _, func in device_mod.functions.items()
-            if func.attrs is not None and SHARED_MEMORY_ATTR in func.attrs
-        ),
-        default=0,
-    )
+    declared = [
+        int(func.attrs[SHARED_MEMORY_ATTR])
+        for _, func in device_mod.functions.items()
+        if func.attrs is not None and SHARED_MEMORY_ATTR in func.attrs
+    ]
+    return max(declared) if declared else None
 
 
 def halvings(start: int, floor: int) -> Iterator[int]:
@@ -193,7 +200,7 @@ def build_with_largest_fitting_tiling(
     requested: T,
     derived: Iterable[T],
     compile_tiling: Callable[[T], Any],
-    required_bytes: Callable[[T], int],
+    required_bytes: Callable[[T], int | None],
     budget: int,
     describe: Callable[[T], str],
     what: str,
@@ -225,6 +232,26 @@ def build_with_largest_fitting_tiling(
             if not is_retryable_build_error(exc):
                 raise
             continue  # cannot be lowered at all, for one of the two non-size reasons
+        if required is None:
+            # The requirement could not be read, so this candidate cannot be planned for. Fall back
+            # to the older strategy for it -- attempt the compilation and let that be the answer.
+            # Costs a build per candidate instead of a lowering, which is the price of not knowing.
+            if not _warned_unreadable:
+                logger.warning(
+                    "[%s] tilelang did not report %s on the lowered kernel, so tilings are being "
+                    "compiled to find out whether they fit. Check whether tilelang renamed it.",
+                    what,
+                    SHARED_MEMORY_ATTR,
+                )
+                _warned_unreadable.add(True)
+            try:
+                kernel = compile_tiling(candidate)
+            except Exception as exc:
+                if not is_retryable_build_error(exc):
+                    raise
+                continue
+            logger.warning("[%s] shared memory forced a smaller tiling on this GPU: %s", what, describe(candidate))
+            return kernel, candidate
         if required > budget:
             continue
         logger.warning(
