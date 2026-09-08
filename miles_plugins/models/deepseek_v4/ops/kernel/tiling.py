@@ -34,10 +34,12 @@ Consequences worth stating, since they are what this module buys:
 
 The cost is a dependency on three tilelang internals: ``JITImpl.get_tir``, ``engine.lower`` with
 device compilation disabled, and the ``dyn_shared_memory_buf`` attribute name. That is a deliberate
-trade against the alternative, which is matching three error strings: an attribute that disappears
-raises AttributeError on the spot, whereas a reworded error string makes the whole mechanism stop
-firing silently. Both couplings are pinned by tests. The right long-term home for this is tilelang
-itself, which computes the number and then throws it away into a formatted string.
+trade against the alternative, which is matching error strings: an attribute that disappears raises
+AttributeError on the spot, whereas a reworded error string would make the mechanism stop firing
+*silently*. For the same reason no control flow here branches on an error's text -- a rejection
+starts the search whether or not this module recognises it, and the markers below survive only to
+label log lines. The couplings that remain are pinned by tests. The right long-term home for all of
+this is tilelang itself, which computes the number and then throws it away into a formatted string.
 """
 
 from __future__ import annotations
@@ -69,8 +71,14 @@ SHARED_MEMORY_ATTR = "dyn_shared_memory_buf"
 #
 # Even with the requirement known exactly, a candidate can still be unbuildable for reasons that
 # have nothing to do with size: tilelang rejects one in three unrelated places, and all three
-# surface while lowering. Matching the text couples this to the tilelang version, which is why
-# tests check the one wording that has an importable source.
+# surface while lowering.
+#
+# These markers are DIAGNOSTIC ONLY. Nothing in the search branches on them -- a rejection starts
+# the search whether or not it is recognised, and an unbuildable candidate is skipped whether or
+# not it is recognised. They exist so the log can distinguish "refused for a reason we understand"
+# from "refused for a reason we do not", which is the difference between a normal fallback and a
+# tilelang change worth looking at. A reword therefore costs one unhelpful log line, not the
+# mechanism.
 # ---------------------------------------------------------------------------------------------
 SHARED_MEMORY_EXCEEDED = "exceeds device limit"  # the shared-memory check at codegen
 WARP_PARTITION_DEGENERATE = "Divide by zero"  # warp partitioning inside T.gemm
@@ -87,7 +95,10 @@ RETRYABLE_ASSERTIONS = ("block_H",)
 
 
 def is_retryable_build_error(exc: BaseException) -> bool:
-    """Is this "try a different tiling" rather than "the caller or the kernel is wrong"?"""
+    """Is this a rejection this module already understands?
+
+    Diagnostic only; see the note above the markers. The search does not branch on the answer.
+    """
     message = str(exc)
     if isinstance(exc, AssertionError):
         return any(marker in message for marker in RETRYABLE_ASSERTIONS)
@@ -213,27 +224,42 @@ def build_with_largest_fitting_tiling(
     for this machinery -- not a wasted compilation and not even a lowering. Only once it has been
     refused does the search start asking about alternatives, and then it compiles exactly one.
 
+    Any rejection starts the search, and it is deliberately not conditioned on recognising the
+    rejection. Gating it on ``is_retryable_build_error`` would mean that a tilelang release which
+    rewords one message turns the whole mechanism off, and turns it off *silently*: the caller sees
+    the original shared-memory error and nothing indicates that a working tiling was one lowering
+    away. Starting unconditionally cannot produce a wrong answer, because a caller error -- a topk
+    that does not divide the block, a dim that is not a power of two -- fails every candidate the
+    same way and ends at the ``raise`` below with the caller's own message. It costs a bounded
+    number of lowerings, once per shape, to buy independence from tilelang's error wording.
+
     If nothing fits, the *requested* tiling's rejection is raised rather than the last candidate's:
     it names the shape the caller asked for and the budget it exceeded, which is the useful message.
     """
     try:
         return compile_tiling(requested), requested
     except Exception as exc:
-        if not is_retryable_build_error(exc):
-            raise
         # Carrying the exception out of its `except` block keeps its __traceback__, and through the
         # frame chain every local of every caller -- during a model forward, its activation tensors.
         # The cycle that forms is only breakable by the cyclic collector, so those tensors sit on
         # the device until something triggers a full gc pass. The message is all the re-raise needs.
         requested_error = exc.with_traceback(None)
+        if not is_retryable_build_error(exc):
+            # Still searched, for the reason in the docstring. Say so, because the alternative
+            # reading of the messages that follow is that the kernel is broken.
+            logger.debug(
+                "[%s] the requested tiling was refused for an unrecognised reason (%s: %s); "
+                "searching for a smaller one anyway",
+                what,
+                type(exc).__name__,
+                str(exc).strip().splitlines()[0] if str(exc).strip() else "",
+            )
 
     for candidate in derived:
         try:
             required = required_bytes(candidate)
-        except Exception as exc:
-            if not is_retryable_build_error(exc):
-                raise
-            continue  # cannot be lowered at all, for one of the two non-size reasons
+        except Exception:
+            continue  # cannot be lowered at all; the requested tiling's error is the one to report
         if required is None:
             # The requirement could not be read, so this candidate cannot be planned for. Fall back
             # to the older strategy for it -- attempt the compilation and let that be the answer.
@@ -248,9 +274,7 @@ def build_with_largest_fitting_tiling(
                 _warned_unreadable.add(what)
             try:
                 kernel = compile_tiling(candidate)
-            except Exception as exc:
-                if not is_retryable_build_error(exc):
-                    raise
+            except Exception:
                 continue
             # Deliberately not the message below: without the requirement there is nothing to
             # attribute the rejection to, only the fact that this candidate is the first that built.
