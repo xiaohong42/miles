@@ -136,13 +136,47 @@ def test_the_requirement_is_the_largest_any_device_function_declares():
     assert tiling.largest_declared_shared_memory(_Mod()) == 68608
 
 
-def test_a_kernel_declaring_no_dynamic_shared_memory_reports_zero():
-    """Not a failure to find out: some kernels genuinely need none."""
+def test_an_unreadable_requirement_is_none_not_zero():
+    """Zero would be the worst possible answer: every candidate would look like it fits."""
 
-    class _Mod:
+    class _Empty:
         functions = {}
 
-    assert tiling.largest_declared_shared_memory(_Mod()) == 0
+    class _Renamed:
+        functions = {"main": type("F", (), {"attrs": {"dyn_shared_memory_buffer": 141312}})()}
+
+    assert tiling.largest_declared_shared_memory(_Empty()) is None
+    assert tiling.largest_declared_shared_memory(_Renamed()) is None
+
+
+def test_an_unreadable_requirement_falls_back_to_compiling_rather_than_assuming_it_fits():
+    """A tilelang rename must degrade to try-and-retry, not silently undo the whole fallback.
+
+    With `default=0` the search took the first and largest candidate, compiled it, and died with
+    the shared-memory error this module exists to route around.
+    """
+    too_big = RuntimeError("Requested dynamic shared memory 141312 exceeds device limit 65536")
+    compiled = []
+
+    def compile_tiling(candidate):
+        compiled.append(candidate)
+        if candidate in ("requested", "biggest"):
+            raise too_big
+        return f"kernel({candidate})"
+
+    kernel, chosen = tiling.build_with_largest_fitting_tiling(
+        requested="requested",
+        derived=["biggest", "fits"],
+        compile_tiling=compile_tiling,
+        required_bytes=lambda _: None,
+        budget=65536,
+        describe=str,
+        what="probe",
+    )
+
+    assert chosen == "fits", "the search must keep going instead of taking the first candidate"
+    assert compiled == ["requested", "biggest", "fits"]
+    assert kernel == "kernel(fits)"
 
 
 def test_the_requirement_is_read_through_device_mod_when_there_is_one():
