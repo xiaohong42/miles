@@ -10,7 +10,6 @@ import torch
 from tilelang import language as T
 
 from miles_plugins.models.deepseek_v4.ops.kernel.tiling import (
-    RETRYABLE_BUILD_ERRORS,
     BackwardTiling,
     DeviceLimits,
     build_with_largest_fitting_tiling,
@@ -18,9 +17,6 @@ from miles_plugins.models.deepseek_v4.ops.kernel.tiling import (
     shared_memory_required,
     sparse_mla_backward_tilings,
 )
-
-# Re-exported: tilelang_sparse_mla.py probes buildability through this name.
-__all__ = ["RETRYABLE_BUILD_ERRORS", "bwd", "bwd_within_shared_mem", "sparse_mqa_bwd_interface"]
 
 
 @tilelang.jit(out_idx=[-1])

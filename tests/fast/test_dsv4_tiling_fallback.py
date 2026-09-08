@@ -275,15 +275,37 @@ def test_an_empty_candidate_set_raises_the_request_s_rejection_not_none():
         _driver({"requested": SHARED_MEM_ERROR}, {}, [])
 
 
-def test_an_unrelated_failure_from_the_request_is_not_retried():
-    """A genuine kernel bug must surface, not be masked as "this tiling does not fit"."""
+def test_a_genuine_bug_from_the_request_still_surfaces():
+    """Searching anyway must not swallow it: no candidate fits, so it is what gets raised."""
     with pytest.raises(RuntimeError, match="illegal memory access"):
-        _driver({"requested": RuntimeError("illegal memory access")}, {}, ["unused"])
+        _driver({"requested": RuntimeError("illegal memory access")}, {"a": 90000}, ["a"])
 
 
-def test_a_caller_error_from_the_request_is_not_retried():
+def test_a_caller_error_from_the_request_still_surfaces():
+    """A topk or dim the kernel rejects fails every candidate alike and ends here."""
     with pytest.raises(AssertionError, match="power of 2"):
-        _driver({"requested": AssertionError("dim must be power of 2, got 500")}, {}, ["unused"])
+        _driver(
+            {"requested": AssertionError("dim must be power of 2, got 500")},
+            {"a": AssertionError("dim must be power of 2, got 500")},
+            ["a"],
+        )
+
+
+def test_an_unrecognised_rejection_still_finds_a_fitting_tiling():
+    """The reason for not gating the search on the error text.
+
+    A tilelang release that rewords "exceeds device limit" would, under a gated search, put this
+    device back to square one while reporting the same message it always did. Here the reword
+    costs nothing.
+    """
+    (_, chosen), compiled, _ = _driver(
+        {"requested": RuntimeError("shared memory request of 85488 over the 65536 B cap")},
+        {"fits": 51184},
+        ["fits"],
+    )
+
+    assert chosen == "fits"
+    assert compiled == ["requested", "fits"]
 
 
 def test_an_inapplicable_block_h_is_retried():
@@ -297,7 +319,8 @@ def test_an_inapplicable_block_h_is_retried():
 
 
 @pytest.mark.parametrize("marker", tiling.RETRYABLE_BUILD_ERRORS)
-def test_every_declared_marker_is_retried(marker):
+def test_every_declared_marker_is_recognised(marker):
+    """Recognition only labels a log line; the search runs either way."""
     assert tiling.is_retryable_build_error(RuntimeError(f"... {marker} ..."))
 
 
