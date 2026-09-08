@@ -352,6 +352,13 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     """
     assert q.is_contiguous() and kv.is_contiguous()
     assert topk_idxs.is_contiguous() and lse.is_contiguous()
+    # o and do are asserted nowhere on purpose: do arrives from autograd, which may legitimately
+    # hand back a broadcast view (out.sum().backward() gives a stride-0 tensor). tilelang's stride
+    # check runs inside an "Exception ignored in" context, so a mismatch only prints and the kernel
+    # then reads a stride-0 pointer as if it were dense -- the process dies on a GPU memory access
+    # fault instead of raising. Normalise rather than assert.
+    o = o.contiguous()
+    do = do.contiguous()
     B, S, H, D = q.shape
     _, S_kv, _ = kv.shape
     topk = topk_idxs.shape[-1]
