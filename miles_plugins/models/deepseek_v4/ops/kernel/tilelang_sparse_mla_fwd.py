@@ -64,10 +64,9 @@ def sparse_mqa_fwd(
     D = dim
 
     # block_H caps how many heads one workgroup stages in LDS. Q_shared/O_shared are
-    # [H_per_block, D], so at D=512 bf16 a 64-head block is 65536 B for Q_shared alone -- the
-    # entire gfx942 (64 KiB) budget, with nothing left for KV_shared/S_shared/Lse_shared. Shrinking
-    # block_H is the only lever that helps; num_stages only multiplies KV_shared.
-    # block_H=None keeps the original behaviour (blocks of 64, and only when heads > 64).
+    # [H_per_block, D], so at D=512 bf16 a 64-head block is 65536 B for Q_shared alone, leaving
+    # nothing for KV_shared/S_shared/Lse_shared on a 64 KiB budget. None keeps the original
+    # behaviour: blocks of 64, and only when heads > 64.
     if block_H is None:
         block_H = 64
     if heads > block_H:
@@ -173,27 +172,11 @@ def sparse_mqa_fwd(
     return main
 
 
-# Matched against tilelang's own error text, so it is coupled to the tilelang version. If a
-# tilelang upgrade reworded this, the retry below would stop firing and the shared-memory failure
-# would surface as a hard error instead. tests/fast/test_dsv4_tiling_fallback.py asserts the
-# marker is still what tilelang emits.
-_SHARED_MEM_ERROR = "exceeds device limit"
-# Raised by sparse_mqa_fwd's own `assert heads % block_H == 0`, which is a candidate being
-# inapplicable rather than a caller error. Its sibling asserts (dim not a power of two, topk not
-# divisible by block_I) are caller errors and must not be retried.
-_BLOCK_H_ASSERT = "block_H"
 _fitted_tiling: dict[tuple, ForwardTiling] = {}
 
 
 def _compile_within_shared_mem(heads, dim, topk, sm_scale, block_I, num_stages, threads):
-    """Compile sparse_mqa_fwd with the largest tiling this target can host.
-
-    The requested tiling is compiled optimistically, so a GPU whose shared memory fits it pays
-    nothing for this path. Only once it has been refused are alternatives derived, and then
-    tilelang is asked what each one needs rather than being made to compile it.
-
-    Memoized per shape, so the search happens at most once per shape and only where it is needed.
-    """
+    """Compile sparse_mqa_fwd with the largest tiling this target can host. Memoized per shape."""
 
     def build(tiling):
         return sparse_mqa_fwd(

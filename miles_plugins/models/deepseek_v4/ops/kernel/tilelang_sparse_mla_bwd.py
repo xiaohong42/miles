@@ -265,8 +265,10 @@ _fitted_tiling: dict[tuple, BackwardTiling] = {}
 def bwd_within_shared_mem(B, S, S_kv, H, D, topk, sm_scale=None, block_size=32, threads=128):
     """Build the backward kernel with the largest tiling this target can host.
 
-    Same shape as the forward search: compile what was asked for, and only if that is refused ask
-    tilelang what the alternatives need. Memoized per shape.
+    Memoized on what the answer depends on, which is not the tensor shape: every shared buffer is
+    sized from block_H, block_size and D, so B/S/S_kv cannot move the requirement. Keying on them
+    would re-run the search for every new sequence length, which THD training produces per
+    microbatch.
     """
 
     def build(tiling):
@@ -285,7 +287,7 @@ def bwd_within_shared_mem(B, S, S_kv, H, D, topk, sm_scale=None, block_size=32, 
             max_block_H=tiling.max_block_H,
         )
 
-    key = (B, S, S_kv, H, D, topk, sm_scale)
+    key = (H, D, topk, block_size, threads)
     if key in _fitted_tiling:
         return build(_fitted_tiling[key])
 

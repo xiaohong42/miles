@@ -1,13 +1,7 @@
 """The shared-memory tiling search: what it asks tilelang, what it retries, and what it caches.
 
-The search is exercised here with the shared-memory query stubbed out, so no GPU and no compilation
-are involved. What the stubs stand in for is a lowering of the candidate kernel, which is where the
-real implementation gets its numbers.
-
-The property that matters most is the first one below: the requested tiling is compiled
-optimistically, before anything is derived and before anything is lowered. That is what makes this
-machinery free on a device whose shared memory already fits the shipped tilings -- it costs not one
-wasted compilation and not one wasted lowering there.
+The shared-memory query is stubbed out, so no GPU and no compilation are involved; the stubs stand
+in for a lowering of the candidate kernel, which is where the real implementation gets its numbers.
 """
 
 import inspect
@@ -63,10 +57,7 @@ def test_an_unknown_target_kind_gets_the_permissive_gemm_minimum():
     [(64, 256), (32, 128), (16, 64), (8, 64)],  # 8 clamps to one warp: there is no half-warp
 )
 def test_thread_width_is_derived_from_the_warp_and_the_matrix_core(gemm_n, expected):
-    """Measured on gfx942: block_I / warps >= 16 builds, below it tilelang divides by zero.
-
-    The tilings that shipped used exactly these thread counts, so they were never free parameters.
-    """
+    """The shipped tilings used exactly these thread counts, so they were never free parameters."""
     assert GFX942.threads_for(gemm_n) == expected
 
 
@@ -76,11 +67,10 @@ def test_a_narrower_matrix_core_allows_more_warps():
 
 
 def test_the_head_block_floor_is_not_the_gemm_width_floor():
-    """They constrain different axes: the head block is the gemm's M, min_gemm_n_per_warp is its N.
+    """Different axes: the head block is the gemm's M, min_gemm_n_per_warp is its N.
 
-    They are both 16 on gfx942, which is a coincidence. Deriving one from the other would make the
-    head block floor move with the matrix-core shape, and on a target with min_gemm_n_per_warp=32
-    it would stop generating the block_I=16 that gfx942 needs.
+    Both are 16 on gfx942, which is a coincidence; deriving one from the other would make the head
+    block floor move with the matrix-core shape.
     """
     assert tiling.MIN_HEAD_BLOCK == 16
     assert list(tiling.halvings(64, tiling.MIN_HEAD_BLOCK)) == [64, 32, 16]
@@ -93,11 +83,7 @@ def test_the_head_block_floor_is_not_the_gemm_width_floor():
 
 
 def test_the_attribute_the_requirement_is_read_from_is_the_one_tilelang_sets():
-    """A canary: tilelang's wrapper reads the same attribute to build its error message.
-
-    If tilelang renames it, shared_memory_required would silently start reporting 0 -- "this tiling
-    needs no shared memory" -- and every candidate would look like it fits.
-    """
+    """A canary: tilelang's wrapper reads the same attribute to build its error message."""
     from tilelang.jit.adapter import wrapper
 
     assert tiling.SHARED_MEMORY_ATTR in inspect.getsource(wrapper)
@@ -150,11 +136,7 @@ def test_an_unreadable_requirement_is_none_not_zero():
 
 
 def test_an_unreadable_requirement_falls_back_to_compiling_rather_than_assuming_it_fits():
-    """A tilelang rename must degrade to try-and-retry, not silently undo the whole fallback.
-
-    With `default=0` the search took the first and largest candidate, compiled it, and died with
-    the shared-memory error this module exists to route around.
-    """
+    """A tilelang rename must degrade to try-and-retry, not silently undo the whole fallback."""
     too_big = RuntimeError("Requested dynamic shared memory 141312 exceeds device limit 65536")
     compiled = []
 
@@ -292,12 +274,7 @@ def test_a_caller_error_from_the_request_still_surfaces():
 
 
 def test_an_unrecognised_rejection_still_finds_a_fitting_tiling():
-    """The reason for not gating the search on the error text.
-
-    A tilelang release that rewords "exceeds device limit" would, under a gated search, put this
-    device back to square one while reporting the same message it always did. Here the reword
-    costs nothing.
-    """
+    """A tilelang release that rewords "exceeds device limit" must not disable the search."""
     (_, chosen), compiled, _ = _driver(
         {"requested": RuntimeError("shared memory request of 85488 over the 65536 B cap")},
         {"fits": 51184},
@@ -340,8 +317,7 @@ def test_the_two_markers_without_python_source_are_still_declared():
 def test_the_forward_derivation_offers_the_validated_tiling_at_64_heads():
     """CP=8 on one node forces TP=1, so every rank holds all 64 heads.
 
-    51184 B is what tilelang reports for this tiling, so it is the first offered candidate that
-    fits a 64 KiB budget -- the same one the hand-written list landed on.
+    tilelang reports 51184 B for this tiling, the first offered candidate that fits 64 KiB.
     """
     offered = list(tiling.sparse_mla_forward_tilings(padded_heads=64, topk=512, block_I=64, limits=GFX942))
     assert tiling.ForwardTiling(num_stages=1, block_I=16, threads=64, block_H=32) in offered
@@ -361,11 +337,9 @@ def test_the_forward_derivation_shrinks_the_kv_block_before_the_head_block():
 
 
 def test_the_backward_derivation_prefers_keeping_dq_staged():
-    """Measured: staging dQ through shared memory costs 480 B here, not the 16 KiB the buffer is.
+    """tilelang reuses dQ_shared, so staging dQ costs 480 B, not the 16 KiB the buffer suggests.
 
-    tilelang reuses dQ_shared, so the hand-written list turned dQ staging off for nothing. Keeping
-    it saves a pass of uncoalesced global writes, so it is offered first and the search takes it
-    (52704 B against a 65536 B budget).
+    Keeping it saves a pass of uncoalesced global writes, so it is offered first (52704 B of 65536).
     """
     offered = list(tiling.sparse_mla_backward_tilings(padded_heads=64, topk=512, block_size=32, limits=GFX942))
     staged = tiling.BackwardTiling(
@@ -394,14 +368,40 @@ def test_candidates_that_do_not_divide_topk_are_never_offered():
 
 
 def test_the_fitted_tiling_is_reused_without_searching_again(monkeypatch):
-    """The search runs at most once per shape, so its cost is paid once and only where needed."""
-    built = []
+    """The search runs at most once per shape.
+
+    Counting builds cannot show this: a request that compiles takes one build either way. What the
+    memo removes is the approach to the search, so the target lookup that begins it is counted.
+    """
+    built, targets = [], []
     monkeypatch.setattr(sparse_mla_fwd, "_fitted_tiling", {})
     monkeypatch.setattr(sparse_mla_fwd, "sparse_mqa_fwd", lambda *a, **k: built.append(k) or "kernel")
+    monkeypatch.setattr(sparse_mla_fwd, "current_target", lambda: targets.append(1) or "target")
+    monkeypatch.setattr(sparse_mla_fwd.DeviceLimits, "from_target", staticmethod(lambda _: GFX942))
 
     request = dict(heads=64, dim=512, topk=512, sm_scale=0.044, block_I=64, num_stages=2, threads=256)
     sparse_mla_fwd._compile_within_shared_mem(**request)
     sparse_mla_fwd._compile_within_shared_mem(**request)
 
-    assert len(built) == 2, "one build per call, and no search on the second"
+    assert len(built) == 2, "one build per call"
     assert built[0] == built[1]
+    assert len(targets) == 1, "the second call must not reach the search at all"
+
+
+def test_the_backward_search_is_not_repeated_for_every_sequence_length(monkeypatch):
+    """Every shared buffer is sized from block_H, block_size and D, so B/S/S_kv cannot move it.
+
+    Keying the memo on the shape re-runs the search for every new sequence length, and THD training
+    produces a new one per microbatch.
+    """
+    built, targets = [], []
+    monkeypatch.setattr(sparse_mla_bwd, "_fitted_tiling", {})
+    monkeypatch.setattr(sparse_mla_bwd, "bwd", lambda *a, **k: built.append(k) or "kernel")
+    monkeypatch.setattr(sparse_mla_bwd, "current_target", lambda: targets.append(1) or "target")
+    monkeypatch.setattr(sparse_mla_bwd.DeviceLimits, "from_target", staticmethod(lambda _: GFX942))
+
+    for seq_len in (2048, 4096, 8192):
+        sparse_mla_bwd.bwd_within_shared_mem(1, seq_len, seq_len, 64, 512, 512, 0.044)
+
+    assert len(built) == 3, "one build per call"
+    assert len(targets) == 1, "the shape changed, the tiling question did not"

@@ -1,45 +1,17 @@
 """Choose a kernel tiling the compiler's target can actually host.
 
-The DeepSeek-V4 tilelang kernels ship with tilings tuned for one GPU. On a device with a smaller
-shared-memory budget they do not compile at all, and the failure is a hard error at the first
-forward pass. The hand-written fallback lists that fix this are per-architecture by construction:
-a different head count, a different topk or a different budget needs the list edited. This module
-derives the alternatives instead, and asks tilelang how much shared memory each one needs rather
-than modelling it.
+The DeepSeek-V4 tilelang kernels ship with tilings tuned for one GPU; on a smaller shared-memory
+budget they do not compile at all. Rather than tabulate replacements per architecture, this derives
+candidates from the target's own limits and asks tilelang how much shared memory each one needs.
 
-Two things make that possible, both of which tilelang already knows and neither of which it
-advertises as API.
+Both numbers come from tilelang. The budget is in the target description it builds for every
+compilation; the requirement is the ``dyn_shared_memory_buf`` attribute on the lowered device
+function, the same figure it formats into "Requested dynamic shared memory N exceeds device limit
+M". Reading it needs lowering but not code generation, roughly 4x cheaper than a build.
 
-**The budget** is in the target description, which tilelang builds for every compilation:
-
-    hip -max_num_threads=256 -max_shared_memory_per_block=65536 -max_threads_per_block=256
-        -mcpu=gfx942 -thread_warp_size=64
-
-**The requirement** is the ``dyn_shared_memory_buf`` attribute on the lowered device function --
-the same number tilelang formats into "Requested dynamic shared memory N exceeds device limit M".
-Reading it needs lowering but not code generation, which is about 4x cheaper than a full build
-(2.0 s against 8.2 s on gfx942), and it is exact: 85488 B for block_H=64/block_I=16 and 68608 B for
-block_H=32/block_I=32, matching the error message byte for byte.
-
-Consequences worth stating, since they are what this module buys:
-
-* Nothing here models tilelang's allocator. An earlier attempt did, and got it wrong in a way that
-  mattered -- Q_shared and O_shared share storage, and counting both over-estimated by 27% at
-  block_H=32 and rejected a tiling that does build.
-* No candidate is ever compiled speculatively. The search costs one lowering per candidate and one
-  compilation of the winner.
-* There is no ``torch.version.hip``, no ``torch.cuda.get_device_properties`` and no
-  architecture-string parsing below. A target tilelang can compile for is one this search can plan
-  for.
-
-The cost is a dependency on three tilelang internals: ``JITImpl.get_tir``, ``engine.lower`` with
-device compilation disabled, and the ``dyn_shared_memory_buf`` attribute name. That is a deliberate
-trade against the alternative, which is matching error strings: an attribute that disappears raises
-AttributeError on the spot, whereas a reworded error string would make the mechanism stop firing
-*silently*. For the same reason no control flow here branches on an error's text -- a rejection
-starts the search whether or not this module recognises it, and the markers below survive only to
-label log lines. The couplings that remain are pinned by tests. The right long-term home for all of
-this is tilelang itself, which computes the number and then throws it away into a formatted string.
+This depends on three tilelang internals -- ``JITImpl.get_tir``, ``engine.lower`` with device
+compilation disabled, and the attribute name -- all pinned by tests. It is a deliberate trade
+against matching error strings, which would fail silently rather than loudly.
 """
 
 from __future__ import annotations
@@ -53,77 +25,43 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Entry points that have already reported an unreadable requirement. Keyed so each one says it
-# once -- the three kernels are compiled independently and a reader who only sees the forward's
-# warning would have no reason to think the indexer is doing the same thing.
+# Entry points that have already warned about an unreadable requirement, so each says it once.
 _warned_unreadable: set[str] = set()
 
-# The attribute tilelang leaves on the lowered device function. Named here so a tilelang rename
-# fails loudly in one place instead of being mistaken for "this tiling needs no shared memory".
-# tilelang sets it only on functions that use dynamic shared memory, so "absent" is ambiguous
-# between "this kernel needs none" and "tilelang renamed it". The reader below returns None for
-# both and the search treats that as "cannot plan for this candidate, fall back to compiling it",
-# which degrades to the try-and-retry strategy rather than concluding that everything fits.
+# tilelang sets this only on functions that use dynamic shared memory, so "absent" is ambiguous
+# between "needs none" and "renamed". Named here so a rename fails in one place.
 SHARED_MEMORY_ATTR = "dyn_shared_memory_buf"
 
-# ---------------------------------------------------------------------------------------------
-# What "this candidate cannot be built" looks like
-#
-# Even with the requirement known exactly, a candidate can still be unbuildable for reasons that
-# have nothing to do with size: tilelang rejects one in three unrelated places, and all three
-# surface while lowering.
-#
-# These markers are DIAGNOSTIC ONLY. Nothing in the search branches on them -- a rejection starts
-# the search whether or not it is recognised, and an unbuildable candidate is skipped whether or
-# not it is recognised. They exist so the log can distinguish "refused for a reason we understand"
-# from "refused for a reason we do not", which is the difference between a normal fallback and a
-# tilelang change worth looking at. A reword therefore costs one unhelpful log line, not the
-# mechanism.
-# ---------------------------------------------------------------------------------------------
+# Diagnostic only: nothing branches on these. A rejection starts the search whether or not it is
+# recognised, so a tilelang reword costs one unhelpful log line rather than the mechanism.
 SHARED_MEMORY_EXCEEDED = "exceeds device limit"  # the shared-memory check at codegen
 WARP_PARTITION_DEGENERATE = "Divide by zero"  # warp partitioning inside T.gemm
 VECTORIZE_FAILED = "is_scalar"  # the vectorizer on the atomic store loop
 
 RETRYABLE_BUILD_ERRORS = (SHARED_MEMORY_EXCEEDED, WARP_PARTITION_DEGENERATE, VECTORIZE_FAILED)
 
-# Assertions inside the kernel builders that mean "this candidate does not apply" rather than "the
-# caller made a mistake". Only the head-block one qualifies: a candidate whose block_H does not
-# divide the head count is simply inapplicable. Its siblings -- a dim that is not a power of two, a
-# topk that does not divide block_I -- are caller errors, and retrying them would bury the real
-# message under a pile of later failures.
+# A block_H that does not divide the head count makes a candidate inapplicable. Its sibling asserts
+# -- a dim that is not a power of two, a topk that does not divide block_I -- are caller errors.
 RETRYABLE_ASSERTIONS = ("block_H",)
 
 
 def is_retryable_build_error(exc: BaseException) -> bool:
-    """Is this a rejection this module already understands?
-
-    Diagnostic only; see the note above the markers. The search does not branch on the answer.
-    """
+    """Is this a rejection this module already understands? Diagnostic only."""
     message = str(exc)
     if isinstance(exc, AssertionError):
         return any(marker in message for marker in RETRYABLE_ASSERTIONS)
     return any(marker in message for marker in RETRYABLE_BUILD_ERRORS)
 
 
-# ---------------------------------------------------------------------------------------------
-# Device limits, read from the compiler's target
-# ---------------------------------------------------------------------------------------------
-
-# The smallest N a single matrix-core instruction covers, which bounds how many warps a gemm's
-# output can be split across: with fewer than this many columns per warp, tilelang's warp
-# partitioning divides by zero. This is the one number the target does not carry, so it is keyed on
-# the target kind:
-#   hip   AMD MFMA is 16x16x16, so 16.
-#   cuda  Tensor Core MMA is m16n8k16, so 8.
-# A target that is not listed gets the smaller value, which only ever means more warps are
-# considered than the hardware can use -- those candidates fail to lower and the search moves on.
+# The smallest N one matrix-core instruction covers, which bounds how many warps a gemm's output
+# can split across; below it tilelang's warp partitioning divides by zero. The one limit the target
+# does not carry. MFMA is 16x16x16, Tensor Core MMA is m16n8k16. An unlisted target gets the
+# smaller value, which only offers candidates that then fail to lower.
 _MIN_GEMM_N_PER_WARP = {"hip": 16, "cuda": 8}
 _MIN_GEMM_N_PER_WARP_DEFAULT = 8
 
-# The floor on the head block, which is a different quantity from the one above and must not be
-# derived from it: the head block is the M dimension of the QK^T gemm, while min_gemm_n_per_warp
-# constrains N. 16 is the kernels' own floor, from `padded_H = max(next_power_of_2(H), 16)` -- below
-# it there is no head count left to block.
+# The kernels' own floor, from `padded_H = max(next_power_of_2(H), 16)`. Not derivable from
+# min_gemm_n_per_warp: the head block is the QK^T gemm's M, that limit constrains its N.
 MIN_HEAD_BLOCK = 16
 
 
@@ -149,10 +87,8 @@ class DeviceLimits:
     def threads_for(self, gemm_n: int) -> int:
         """The widest thread block whose warps each still get a full matrix-core tile.
 
-        Measured on gfx942 (warp_size 64, min_gemm_n_per_warp 16), sweeping block_I against threads:
-        every combination with ``block_I / warps >= 16`` builds and every one below it fails with
-        "Divide by zero". The tilings that shipped used exactly this expression -- block_I 64, 32,
-        16 give 256, 128, 64 -- so those thread counts were never free parameters.
+        The shipped tilings used exactly this expression -- block_I 64, 32, 16 give 256, 128, 64 --
+        so those thread counts were never free parameters.
         """
         warps = max(1, gemm_n // self.min_gemm_n_per_warp)
         return min(warps * self.warp_size, self.max_threads_per_block)
@@ -167,9 +103,9 @@ def current_target() -> Any:
 def shared_memory_required(prim_func: Any, target: Any) -> int | None:
     """How much dynamic shared memory tilelang's lowered kernel asks for, in bytes.
 
-    Lowers without generating or compiling device code, so this is much cheaper than a build while
-    giving the exact figure the build would have checked. None when the figure is not there to be
-    read -- see SHARED_MEMORY_ATTR.
+    Lowers without generating device code, so it is much cheaper than a build while giving the
+    exact figure the build would have checked. None when it cannot be read -- see
+    SHARED_MEMORY_ATTR.
     """
     from tilelang import engine
 
@@ -181,10 +117,8 @@ def shared_memory_required(prim_func: Any, target: Any) -> int | None:
 def largest_declared_shared_memory(lowered: Any) -> int | None:
     """Read the requirement off a lowered module. Separate so it is testable without a GPU.
 
-    None when no function declares the attribute at all. Returning 0 there would be the worst
-    possible answer: every candidate would look like it fits, the search would take the first and
-    largest, and its compilation would fail with the very shared-memory error this module exists to
-    route around -- silently undoing the fallback rather than reporting that it cannot plan.
+    None when no function declares the attribute. Returning 0 would make every candidate look like
+    it fits, so the search would take the largest and fail with the error it exists to route around.
     """
     device_mod = getattr(lowered, "device_mod", lowered)
     declared = [
@@ -220,33 +154,23 @@ def build_with_largest_fitting_tiling(
 ) -> tuple[Any, T]:
     """Compile the requested tiling; if it will not build, compile the largest one that fits.
 
-    The requested tiling is attempted optimistically, so a device that fits it pays nothing at all
-    for this machinery -- not a wasted compilation and not even a lowering. Only once it has been
-    refused does the search start asking about alternatives, and then it compiles exactly one.
+    The requested tiling is attempted optimistically, so a device that fits it pays nothing here --
+    not a wasted compilation and not even a lowering. Only a rejection starts the search, and the
+    search compiles exactly one candidate.
 
-    Any rejection starts the search, and it is deliberately not conditioned on recognising the
-    rejection. Gating it on ``is_retryable_build_error`` would mean that a tilelang release which
-    rewords one message turns the whole mechanism off, and turns it off *silently*: the caller sees
-    the original shared-memory error and nothing indicates that a working tiling was one lowering
-    away. Starting unconditionally cannot produce a wrong answer, because a caller error -- a topk
-    that does not divide the block, a dim that is not a power of two -- fails every candidate the
-    same way and ends at the ``raise`` below with the caller's own message. It costs a bounded
-    number of lowerings, once per shape, to buy independence from tilelang's error wording.
-
-    If nothing fits, the *requested* tiling's rejection is raised rather than the last candidate's:
-    it names the shape the caller asked for and the budget it exceeded, which is the useful message.
+    Any rejection starts it, whether or not this module recognises the message: gating on the text
+    would let a tilelang reword disable the fallback silently. Starting unconditionally cannot give
+    a wrong answer, because a caller error fails every candidate alike and ends at the ``raise``
+    below with the caller's own message -- which names the requested shape and is the useful one.
     """
     try:
         return compile_tiling(requested), requested
     except Exception as exc:
-        # Carrying the exception out of its `except` block keeps its __traceback__, and through the
-        # frame chain every local of every caller -- during a model forward, its activation tensors.
-        # The cycle that forms is only breakable by the cyclic collector, so those tensors sit on
-        # the device until something triggers a full gc pass. The message is all the re-raise needs.
+        # Carrying the exception out of its `except` block would keep __traceback__, and with it
+        # every caller's locals -- during a forward, its activation tensors, freeable only by the
+        # cyclic collector. The message is all the re-raise needs.
         requested_error = exc.with_traceback(None)
         if not is_retryable_build_error(exc):
-            # Still searched, for the reason in the docstring. Say so, because the alternative
-            # reading of the messages that follow is that the kernel is broken.
             logger.debug(
                 "[%s] the requested tiling was refused for an unrecognised reason (%s: %s); "
                 "searching for a smaller one anyway",
@@ -261,9 +185,8 @@ def build_with_largest_fitting_tiling(
         except Exception:
             continue  # cannot be lowered at all; the requested tiling's error is the one to report
         if required is None:
-            # The requirement could not be read, so this candidate cannot be planned for. Fall back
-            # to the older strategy for it -- attempt the compilation and let that be the answer.
-            # Costs a build per candidate instead of a lowering, which is the price of not knowing.
+            # Unplannable, so fall back to compiling it and letting that be the answer: a build per
+            # candidate instead of a lowering, which is the price of not knowing.
             if what not in _warned_unreadable:
                 logger.warning(
                     "[%s] tilelang did not report %s on the lowered kernel, so tilings are being "
@@ -276,8 +199,8 @@ def build_with_largest_fitting_tiling(
                 kernel = compile_tiling(candidate)
             except Exception:
                 continue
-            # Deliberately not the message below: without the requirement there is nothing to
-            # attribute the rejection to, only the fact that this candidate is the first that built.
+            # Not the message below: with no requirement to attribute the rejection to, all this
+            # says is that the candidate is the first that built.
             logger.warning(
                 "[%s] the requested tiling did not build; compiled the largest candidate that did: %s",
                 what,
@@ -298,14 +221,9 @@ def build_with_largest_fitting_tiling(
     raise requested_error
 
 
-# ---------------------------------------------------------------------------------------------
-# Candidate orders
-#
-# The shrink order is the same everywhere and is a statement about cost, not about any one GPU:
-# give up pipeline depth first (it costs latency hiding only, and the kernels already clamp it),
-# then shrink the KV/index block (more inner iterations), and only then shrink the head block (more
-# grid blocks, and it caps how much of the output one workgroup can accumulate).
-# ---------------------------------------------------------------------------------------------
+# Candidate orders. The shrink order is a statement about cost, not about any one GPU: give up
+# pipeline depth first (latency hiding only), then the KV/index block (more inner iterations), and
+# only then the head block (more grid blocks, and less output one workgroup can accumulate).
 
 
 @dataclass(frozen=True)
@@ -331,9 +249,8 @@ def sparse_mla_forward_tilings(
                 num_stages=1,
                 block_I=index_block,
                 threads=limits.threads_for(index_block),
-                # The kernel's own default already blocks at padded_heads, so say so rather than
-                # restating it: that keeps a device which needs no shrinking on the exact code path
-                # it had before this module existed.
+                # None is the kernel's own "one block of padded_H", so a device that needs no
+                # shrinking stays on the exact code path it had before this module existed.
                 block_H=None if head_block == padded_heads else head_block,
             )
 
@@ -358,24 +275,12 @@ def sparse_mla_backward_tilings(
 ) -> Iterator[BackwardTiling]:
     """Progressively smaller backward tilings, largest first. Excludes the requested one.
 
-    Two of the levers here are not tile sizes. ``split_store`` sets the height of
-    ``acc_dkv_shared``, an fp32 buffer, so raising it to ``block_size`` reduces that buffer to a
-    single row at the cost of one atomic store pass per row. ``stage_dq_through_shared`` removes a
-    whole ``[block_H, D]`` buffer by writing dQ straight to global memory. Both are tried only
-    after the tile sizes are already at their smallest, because both cost bandwidth rather than
-    parallelism.
-
-    Validated on hardware. Offering ``stage_dq=True`` first makes gfx942 select a different
-    backward kernel from the one the earlier 8x MI308X run took, which was ``stage_dq=False``
-    only because the hand-written list offered nothing else. The reasoning was that tilelang
-    reuses dQ_shared, so staging costs 480 B rather than the 16 KiB the buffer suggests. A
-    subsequent 8x MI308X run at 131072 tokens settled on
-
-        block_size=16 threads=64 split_store=16 stage_dq_through_shared=True max_block_H=16
-        (needs 52704 B of 65536)
-
-    and trained 3/3 iterations at CP=4 and CP=8 with no OOM, NaN or shared-memory overflow, so the
-    staged candidate is now known to train and not merely to fit.
+    Two levers here are not tile sizes. ``split_store`` sets the height of ``acc_dkv_shared``, an
+    fp32 buffer, so raising it to ``block_size`` cuts that buffer to one row at the cost of an
+    atomic store pass per row. ``stage_dq_through_shared`` drops a whole ``[block_H, D]`` buffer by
+    writing dQ straight to global memory. Both come last, because both cost bandwidth rather than
+    parallelism, and staging dQ is kept for as long as possible: tilelang reuses dQ_shared, so it
+    costs 480 B rather than the 16 KiB the buffer suggests.
     """
     for head_block in halvings(padded_heads, MIN_HEAD_BLOCK):
         for kv_block in halvings(block_size, limits.min_gemm_n_per_warp):
