@@ -60,6 +60,7 @@ from .lora_utils import is_lora_enabled, lora_rollout_enabled
 from .model import TrainStepOutcome, forward_only, initialize_model_and_optimizer, save, train
 from .named_weights import named_params_and_buffers
 from .parallel import verify_megatron_parallel_state
+from .recompute_gc import enable_recompute_backward_gc
 from .replay_utils import register_replay_list_moe
 
 if TYPE_CHECKING:
@@ -99,6 +100,7 @@ class MegatronTrainRayActor(TrainRayActor):
         indep_dp_info: IndepDPInfo,
     ) -> int | None:
         monkey_patch_torch_dist()
+        enable_recompute_backward_gc()
 
         super().init(args, role, with_ref, with_opd_teacher=with_opd_teacher)
 
