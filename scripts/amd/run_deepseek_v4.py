@@ -292,6 +292,28 @@ def _get_parallel_config(args: ScriptArgs) -> str:
                 "--expert-tensor-parallel-size 1 "
             )
 
+        if total_gpus == 16:  # 2 nodes x 8 GPUs: PP2/EP8, 43 layers = 22+21
+            pipeline_size = 2
+            cp_size = args.context_parallel_size
+            if total_gpus % (pipeline_size * cp_size):
+                raise NotImplementedError(
+                    f"--context-parallel-size {cp_size} does not divide {total_gpus} GPUs "
+                    f"over {pipeline_size} pipeline stages."
+                )
+            tensor_size = total_gpus // (pipeline_size * cp_size)
+            config = f"--tensor-model-parallel-size {tensor_size} "
+            if tensor_size > 1:
+                config += "--sequence-parallel "
+            config += (
+                f"--pipeline-model-parallel-size {pipeline_size} "
+                "--decoder-first-pipeline-num-layers 22 "
+                "--decoder-last-pipeline-num-layers 21 "
+                f"--context-parallel-size {cp_size} "
+            )
+            if cp_size > 1:
+                config += "--allgather-cp "
+            return config + "--expert-model-parallel-size 8 " "--expert-tensor-parallel-size 1 "
+
     raise NotImplementedError(
         f"No pre-set parallel config for {total_gpus} GPUs. "
         f"Please specify your parallel config in `run_deepseek_v4._get_parallel_config`."
