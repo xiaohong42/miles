@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from itertools import count
 
 import ray
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
@@ -143,6 +144,8 @@ async def _train_with_components(
         )
 
     maybe_start_mini_ft_controller(args)
+    continuous = getattr(args, "continuous_rollout", False)
+    final_rollout = None if continuous else args.num_rollout
 
     # always update weight first so that sglang has the loaded weights from training.
     await update_weights(actor_model, rollout_executor)
@@ -174,7 +177,7 @@ async def _train_with_components(
             await actor_model.clear_memory()
 
     async def save(rollout_id, force_sync=False):
-        force_sync = force_sync or rollout_id == args.num_rollout - 1
+        force_sync = force_sync or (not continuous and rollout_id == args.num_rollout - 1)
 
         async def save_training_model(model):
             if args.use_critic and args.offload_train:
@@ -198,7 +201,8 @@ async def _train_with_components(
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
-    for rollout_id in range(args.start_rollout_id, args.num_rollout):
+    rollout_ids = count(args.start_rollout_id) if continuous else range(args.start_rollout_id, args.num_rollout)
+    for rollout_id in rollout_ids:
         await inference_controller.prepare_rollout(rollout_id)
         rollout_data_pack = await rollout_executor.get.remote(rollout_id)
 
@@ -229,7 +233,7 @@ async def _train_with_components(
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
         if external_save or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+            rollout_id, args.save_interval, num_rollout_per_epoch, final_rollout
         ):
             await save(rollout_id, force_sync=external_save)
             if external_save:
@@ -249,9 +253,9 @@ async def _train_with_components(
         if args.offload_rollout:
             await inference_controller.onload_kv()
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
+        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, final_rollout):
             await inference_controller.prepare_eval()
-            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
+            await eval_dispatcher.dispatch(rollout_id, force=not continuous and rollout_id == args.num_rollout - 1)
 
         if (
             args.debug_exit_after_rollout is not None
