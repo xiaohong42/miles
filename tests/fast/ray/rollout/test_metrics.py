@@ -175,7 +175,12 @@ class TestComputeZeroStdMetrics:
         args = make_args(advantage_estimator="grpo", reward_key=None)
         samples = make_samples_grouped(2, 4, rewards=[0.0, 0.5, 1.0, 0.7, 0.2, 0.8, 0.3, 0.6])
         out = _compute_zero_std_metrics(args, samples)
-        assert out == {"zero_std/all_zero_percentage": 0.0, "zero_std/all_one_percentage": 0.0}
+        assert out == {
+            "zero_std/percentage": 0.0,
+            "zero_std/all_zero_percentage": 0.0,
+            "zero_std/all_one_percentage": 0.0,
+            "zero_std/all_negative_one_percentage": 0.0,
+        }
 
     def test_grpo_zero_std_groups_produce_bucket_counts_and_percentages(self):
         """1 group all-1, 1 group all-0, 1 group mixed → bucket counts plus the
@@ -197,6 +202,47 @@ class TestComputeZeroStdMetrics:
         assert out["zero_std/count_0.5"] == 2
         assert out["zero_std/all_zero_percentage"] == 0.0
         assert out["zero_std/all_one_percentage"] == 0.0
+
+    @pytest.mark.parametrize("zero, one", [(0, 1), (False, True), (0.0, 1.0)])
+    def test_binary_reward_types_use_same_buckets_and_percentages(self, zero, one):
+        args = make_args(advantage_estimator="grpo", reward_key=None)
+        samples = make_samples_grouped(2, 2, rewards=[zero, zero, one, one])
+        out = _compute_zero_std_metrics(args, samples)
+        assert out["zero_std/count_0.0"] == 1
+        assert out["zero_std/count_1.0"] == 1
+        assert out["zero_std/all_zero_percentage"] == 0.5
+        assert out["zero_std/all_one_percentage"] == 0.5
+        assert out["zero_std/percentage"] == 1.0
+
+    def test_mixed_numeric_types_and_negative_zero_share_bucket(self):
+        args = make_args(advantage_estimator="grpo", reward_key=None)
+        samples = make_samples_grouped(2, 2, rewards=[0, 0.0, -0.0, False])
+        out = _compute_zero_std_metrics(args, samples)
+        assert out["zero_std/count_0.0"] == 2
+        assert "zero_std/count_-0.0" not in out
+        assert out["zero_std/all_zero_percentage"] == 1.0
+
+    def test_rounded_display_buckets_do_not_define_exact_endpoint_rates(self):
+        args = make_args(advantage_estimator="grpo", reward_key=None)
+        samples = make_samples_grouped(3, 2, rewards=[0.04, 0.04, 0.96, 0.96, -0.96, -0.96])
+        out = _compute_zero_std_metrics(args, samples)
+        assert out["zero_std/count_0.0"] == 1
+        assert out["zero_std/count_1.0"] == 1
+        assert out["zero_std/count_-1.0"] == 1
+        assert out["zero_std/all_zero_percentage"] == 0.0
+        assert out["zero_std/all_one_percentage"] == 0.0
+        assert out["zero_std/all_negative_one_percentage"] == 0.0
+        assert out["zero_std/percentage"] == 1.0
+
+    def test_signed_dapo_scores_report_all_equal_groups(self):
+        args = make_args(advantage_estimator="grpo", reward_key="score")
+        rewards = [{"score": score} for score in [-1, -1.0, 1, 1.0, -1, 1]]
+        samples = make_samples_grouped(3, 2, rewards=rewards)
+        out = _compute_zero_std_metrics(args, samples)
+        assert out["zero_std/all_zero_percentage"] == 0.0
+        assert out["zero_std/all_negative_one_percentage"] == pytest.approx(1 / 3)
+        assert out["zero_std/all_one_percentage"] == pytest.approx(1 / 3)
+        assert out["zero_std/percentage"] == pytest.approx(2 / 3)
 
     def test_empty_samples_does_not_crash(self):
         args = make_args(advantage_estimator="grpo", reward_key=None)
