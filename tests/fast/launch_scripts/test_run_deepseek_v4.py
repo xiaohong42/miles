@@ -4,8 +4,6 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-from typer.testing import CliRunner
-
 from tests.fast.launch_scripts.py_harness import (
     REPO_ROOT,
     call_entrypoint,
@@ -13,6 +11,7 @@ from tests.fast.launch_scripts.py_harness import (
     import_launch_script,
     install_command_recorder,
 )
+from typer.testing import CliRunner
 
 
 @pytest.mark.parametrize(
@@ -368,15 +367,22 @@ def test_fp8_smoke_cli_emits_exact_recipe_and_config_paths(monkeypatch, fp8_smok
         fp8_smoke_launcher.app,
         [
             "train",
-            "--profile", "fp8_smoke",
+            "--profile",
+            "fp8_smoke",
             "--skip-process-cleanup",
             "--no-join-ray-workers",
-            "--model-dir", "/models",
-            "--model-local-dir", "/local-models",
-            "--data-dir", "/data",
-            "--save-dir", "/checkpoints",
-            "--run-id", "profile-test",
-            "--megatron-path", "/megatron",
+            "--model-dir",
+            "/models",
+            "--model-local-dir",
+            "/local-models",
+            "--data-dir",
+            "/data",
+            "--save-dir",
+            "/checkpoints",
+            "--run-id",
+            "profile-test",
+            "--megatron-path",
+            "/megatron",
         ],
     )
     assert result.exit_code == 0, result.exception
