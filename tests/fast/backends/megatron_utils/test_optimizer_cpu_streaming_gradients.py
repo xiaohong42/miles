@@ -450,6 +450,7 @@ def test_incompatible_args_rejected(streams, change, match):
         ("batched", "exactly one"),
         ("mapping", "mapping"),
         ("missing_hook", "copy-back hook"),
+        ("unrelated_hook", "copy-back hook"),
         ("stream", "stream"),
         ("cached", "cached CPU gradients"),
         ("overlap", "per-parameter overlap"),
@@ -463,8 +464,10 @@ def test_capability_checks_are_atomic_across_wrappers(streams, defect, match):
         child.param_groups[0]["params"].append(sources(bad.cpu_optimizers[1])[0])
     elif defect == "mapping":
         del bad.cpu_copys_map_gpu_param[param]
-    elif defect == "missing_hook":
+    elif defect in ("missing_hook", "unrelated_hook"):
         child._optimizer_step_post_hooks.clear()
+        if defect == "unrelated_hook":
+            child.register_step_post_hook(lambda *_: None)
     elif defect == "stream":
         bad._h2d_stream = object()
     elif defect == "cached":
