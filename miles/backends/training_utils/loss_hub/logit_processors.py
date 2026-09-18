@@ -63,8 +63,10 @@ def _iter_response_chunks(
             if (logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0)
             else None
         )
-        chunk_dtype = torch.bfloat16 if getattr(args, "bf16", False) else (
-            torch.float16 if getattr(args, "fp16", False) else None
+        chunk_dtype = (
+            torch.bfloat16
+            if getattr(args, "bf16", False)
+            else (torch.float16 if getattr(args, "fp16", False) else None)
         )
     else:
         temperature = None
