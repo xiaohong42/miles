@@ -247,18 +247,22 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
     interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
 
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
-
-    counts = {reward: len(items) for reward, items in group_by(interesting_rewards).items()}
+    interesting_rewards = [g[0].get_reward_value(args) for g in interesting_sample_groups]
+    # Normalize int/float/bool and signed zero for display only. Rounded buckets
+    # must not define exact endpoint rates (e.g. 0.04 is not a zero reward).
+    reward_buckets = [str(round(float(reward), 1) + 0.0) for reward in interesting_rewards]
+    counts = {reward: len(items) for reward, items in group_by(reward_buckets).items()}
     log_dict = {f"zero_std/count_{reward}": count for reward, count in counts.items()}
 
-    # Percentages over total groups, so "too hard" (all-0) and "too easy"
-    # (all-1) rates are comparable across runs without needing to know the
-    # rollout batch size.
+    # All rates use total prompt groups as the denominator. Endpoint names are
+    # numeric, not accuracy claims: DAPO scores use -1/+1 rather than 0/1.
     total_groups = len(all_sample_groups)
     if total_groups > 0:
-        log_dict["zero_std/all_zero_percentage"] = counts.get("0.0", 0) / total_groups
-        log_dict["zero_std/all_one_percentage"] = counts.get("1.0", 0) / total_groups
+        log_dict["zero_std/percentage"] = len(interesting_sample_groups) / total_groups
+        for name, value in (("zero", 0), ("one", 1), ("negative_one", -1)):
+            log_dict[f"zero_std/all_{name}_percentage"] = (
+                sum(reward == value for reward in interesting_rewards) / total_groups
+            )
 
     return log_dict
 
