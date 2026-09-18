@@ -1,7 +1,11 @@
 from types import SimpleNamespace
 
 import pytest
-from tests.fast.ray.rollout.conftest import make_args, track_server_cell
+from tests.fast.ray.rollout.conftest import dispose_tracked_server_cells, make_args, track_server_cell
+
+# CI's explicit file batches may disable conftest discovery. Register the
+# teardown fixture in this module as well, rather than dropping cleanup.
+_ = dispose_tracked_server_cells
 
 from miles.ray.rollout import server_cell as server_cell_module
 from miles.ray.rollout.cell_state import CellAddrInfo
