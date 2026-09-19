@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from tests.fast.ray.rollout.conftest import make_args, track_server_cell
+from tests.fast.ray.rollout.conftest import dispose_tracked_server_cells, make_args, track_server_cell
 
 from miles.ray.rollout import server_cell as server_cell_module
 from miles.ray.rollout.cell_state import CellAddrInfo, StatePendingWeights, StateServing, StateUninitialized
@@ -26,6 +26,8 @@ from miles.utils.ft_utils.health_checker import (
 )
 from miles.utils.test_utils.clock import FakeClock
 
+# Keep teardown discoverable when CI collects explicit files without conftest.
+_ = dispose_tracked_server_cells
 pytestmark = pytest.mark.usefixtures("dispose_tracked_server_cells")
 
 _ENDPOINT_CALLS: list[tuple[str, str]] = []

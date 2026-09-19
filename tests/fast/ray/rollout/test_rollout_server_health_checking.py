@@ -3,10 +3,6 @@ from types import SimpleNamespace
 import pytest
 from tests.fast.ray.rollout.conftest import dispose_tracked_server_cells, make_args, track_server_cell
 
-# CI's explicit file batches may disable conftest discovery. Register the
-# teardown fixture in this module as well, rather than dropping cleanup.
-_ = dispose_tracked_server_cells
-
 from miles.ray.rollout import server_cell as server_cell_module
 from miles.ray.rollout.cell_state import CellAddrInfo
 from miles.ray.rollout.rollout_server import RolloutServer
@@ -14,6 +10,8 @@ from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
 from miles.utils.context_lock import ContextLock
 from miles.utils.ft_utils.health_checker import ActiveAndEpoch, NoopHealthChecker, SimpleHealthChecker
 
+# Keep teardown discoverable when CI collects explicit files without conftest.
+_ = dispose_tracked_server_cells
 pytestmark = pytest.mark.usefixtures("dispose_tracked_server_cells")
 
 _ADDR_INFO = CellAddrInfo(
