@@ -13,6 +13,11 @@
 #    build-arg:SGLANG_IMAGE_REPO=rocm/sgl-dev  SGLANG_IMAGE_TAG=v0.5.19-rocm700-mi30x-20260908
 #                GPU_ARCH=gfx942  FA_USE_WHEEL=0  TE_USE_WHEEL=0  APPLY_AITER_GFX942_PATCHES=1
 #                WHEELS_TAG_ROCM=rocm720-gfx950-v0.5.16  APEX_USE_PREBUILT=0  APPLY_ROCR_VMMFIX=0  NVRX_INSTALL=0
+#    The delivered gfx942 stack lives on the two forks, so pin it explicitly:
+#                MILES_REPO=xiaohong42/miles    MILES_COMMIT=<delivery commit>
+#                SGLANG_REMOTE=https://github.com/xiaohong42/sglang.git
+#                SGLANG_BRANCH=amd/dsv4-two-node-fp8-0920  SGLANG_COMMIT=203edb44c37a
+#                MEGATRON_COMMIT=8c1e05747eb612b382df2632783df5c83a853646
 #    There is no gfx942 wheels shelf, and none is needed. The mi30x base already ships apex and a
 #    fat gfx942+gfx950 flash_attn, TE is source-built from the immutable v2.8_rocm tag, and the only
 #    two assets still taken from the shelf - the sglang_router wheel and the sgl-model-gateway
@@ -28,11 +33,14 @@ FROM ${SGLANG_IMAGE_REPO}:${SGLANG_IMAGE_TAG} AS sglang
 SHELL ["/bin/bash", "-ceuxo", "pipefail"]
 
 # ======================================== Arguments ============================================
+ARG SGLANG_REMOTE=origin
 ARG SGLANG_BRANCH=sglang-miles
 ARG SGLANG_COMMIT=""
 
 ARG MEGATRON_REPO=radixark/Megatron-LM
 ARG MEGATRON_BRANCH=miles-main
+# Empty keeps the branch tip; set it to pin a build to one commit.
+ARG MEGATRON_COMMIT=""
 
 # A fork's branch is only buildable if the clone can point at that fork.
 ARG MILES_REPO=radixark/miles
@@ -165,16 +173,23 @@ RUN if [ "${APPLY_AITER_GFX942_PATCHES}" = "1" ]; then \
 RUN rm -rf /root/Megatron-LM && \
     git clone --recursive -b ${MEGATRON_BRANCH} https://github.com/${MEGATRON_REPO}.git /root/Megatron-LM && \
     cd /root/Megatron-LM && \
+    if [ -n "${MEGATRON_COMMIT}" ]; then \
+      git checkout --recurse-submodules ${MEGATRON_COMMIT}; \
+    fi && \
+    git --no-pager log --oneline -1 && \
     pip install -e .
 
+# SGLANG_REMOTE defaults to the base image's own remote. A fork's branch is only reachable when the
+# fetch is pointed at that fork, so a delivery that lives on one must set SGLANG_REMOTE.
 RUN cd /sgl-workspace/sglang && \
     git reset --hard && \
-    git fetch origin ${SGLANG_BRANCH} && \
+    git fetch ${SGLANG_REMOTE} ${SGLANG_BRANCH} && \
     if [ -n "${SGLANG_COMMIT}" ]; then \
       git checkout ${SGLANG_COMMIT}; \
     else \
       git checkout FETCH_HEAD; \
     fi && \
+    git --no-pager log --oneline -1 && \
     pip install -e "python[all_hip]" --no-deps
 
 # SGLang is installed without dependencies, but its Inkling multimodal processor imports numba.
