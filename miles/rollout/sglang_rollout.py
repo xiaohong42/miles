@@ -13,6 +13,7 @@ import sglang_router
 from packaging.version import parse
 from tqdm import tqdm
 
+from miles.ray.rollout.debug_data import save_rollout_candidate_evidence, summarize_rollout_candidates
 from miles.rollout.base_types import GenerateFnInput, RolloutFnEvalOutput, RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer
 from miles.rollout.filter_hub.common_filters import apply_preput_filters
@@ -26,7 +27,6 @@ from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.misc import SingletonMeta, call_agent_abort_hook
-from miles.utils.multi_lora import make_rid, slot_lora_name
 from miles.utils.processing_utils import (
     call_processor,
     encode_image_for_rollout_engine,
@@ -48,6 +48,9 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
+
+_ROLLOUT_ABORT_TIMEOUT_SECONDS = 5.0
+_ROLLOUT_CANCEL_TIMEOUT_SECONDS = 5.0
 
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
@@ -121,6 +124,7 @@ class GenerateState(metaclass=SingletonMeta):
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
+        self.submitted_candidate_groups = 0
         self.pendings = set()
         self.aborted = False
 
@@ -137,7 +141,8 @@ class GenerateState(metaclass=SingletonMeta):
                     )
                 )
             )
-        self.remaining_batch_size += len(samples)
+            self.submitted_candidate_groups += 1
+            self.remaining_batch_size += 1
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
@@ -183,22 +188,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if getattr(args, "use_opd", False) and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
         payload["top_logprobs_num"] = opd_top_k
 
-    if sample.adapter is not None:
-        from miles.ray.multi_lora.controller import AdaptersCache
-
-        if (adapter := await AdaptersCache().get(sample.adapter.name)) is None:
-            # Adapter deregistered: don't POST, or an orphan the abort round can't see
-            # would keep decoding under the slot's next tenant and pollute its group.
-            logger.warning(
-                f"Dropping generation for adapter '{sample.adapter.name}' (slot {sample.adapter.slot}): "
-                "adapter is no longer sampleable"
-            )
-            sample.status = Sample.Status.ABORTED
-            return sample
-        payload["lora_path"] = slot_lora_name(sample.adapter.slot)
-        payload["rid"] = make_rid(sample.adapter.name)
-        payload["extra_key"] = f"{sample.adapter.name}:v{adapter.version}"
-    elif lora_rollout_enabled(args):
+    if lora_rollout_enabled(args):
         payload["lora_path"] = LORA_ADAPTER_NAME
 
     if args.use_rollout_routing_replay:
@@ -371,16 +361,20 @@ async def generate_and_rm_group(
                 sample.routing_key = str(uuid.uuid4())
 
     tasks = []
-    for idx, sample in enumerate(group):
-        current_sampling_params = sampling_params.copy()
-        if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
-            current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
-
-    group = await asyncio.gather(*tasks)
+    try:
+        for idx, sample in enumerate(group):
+            current_sampling_params = sampling_params.copy()
+            if getattr(args, "sglang_enable_deterministic_inference", False):
+                seed = state.group_sampling_seeds[idx]
+                current_sampling_params["sampling_seed"] = seed
+            tasks.append(
+                asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+            )
+        group = await asyncio.gather(*tasks)
+    except BaseException:
+        # gather propagates a child's failure without cancelling its siblings.
+        await _cancel_rollout_tasks(tasks)
+        raise
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
@@ -391,13 +385,48 @@ async def generate_and_rm_group(
     return group
 
 
+def _consume_task_exception(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _cancel_rollout_tasks(tasks) -> None:
+    """Cancel only owned tasks, and never wait indefinitely for a misbehaving plugin."""
+    tasks = set(tasks)
+    if not tasks:
+        return
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    done, pending = await asyncio.wait(tasks, timeout=_ROLLOUT_CANCEL_TIMEOUT_SECONDS)
+    for task in done:
+        _consume_task_exception(task)
+    for task in pending:
+        task.add_done_callback(_consume_task_exception)
+    if pending:
+        logger.error("%d rollout tasks ignored cancellation; cleanup grace period expired", len(pending))
+
+
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
-    aborted_samples = []
-
+    """Best-effort endpoint abort plus bounded local task cleanup."""
     state = GenerateState(args)
-    assert not state.aborted
     state.aborted = True
+    aborted_samples = []
+    abort_task = asyncio.create_task(_abort_and_collect(args, rollout_id, state, aborted_samples))
+    try:
+        done, _ = await asyncio.wait({abort_task}, timeout=_ROLLOUT_ABORT_TIMEOUT_SECONDS)
+        if done:
+            abort_task.result()
+        else:
+            logger.warning("Rollout %s abort timed out; cancelling local generation tasks", rollout_id)
+    finally:
+        await _cancel_rollout_tasks({abort_task} | state.pendings)
+        state.pendings.clear()
+    return aborted_samples
 
+
+async def _abort_and_collect(args, rollout_id, state, aborted_samples) -> None:
+    # Discover only this rollout router's workers, never other model/eval endpoints.
     if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
         urls = response["urls"]
@@ -420,14 +449,14 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     # make sure all the pending tasks are finished
     count = 0
     while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
 
-        if not args.partial_rollout:
-            continue
-
-        # for partial rollout, collect the partial samples into the data buffer
         for task in done:
+            # Keep unconsumed done tasks owned by state if a sibling raises.
+            state.pendings.remove(task)
             group = task.result()
+            if not args.partial_rollout:
+                continue
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
@@ -437,7 +466,275 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
 
-    return aborted_samples
+
+# A shortfall means this attempt's candidates did not fill the batch. An exhausted
+# data source is not in this set: re-sampling it cannot produce different groups.
+RETRYABLE_SHORTFALLS = frozenset({"sampling deadline exceeded", "candidate group budget exhausted"})
+
+
+class InsufficientRolloutBatch(RuntimeError):
+    """One rollout could not assemble enough valid groups.
+
+    ``retryable`` separates "this attempt fell short" from "sampling is not
+    advancing at all", so a retry budget can never mask a dead engine, a
+    stalled queue or an exhausted data source.
+
+    The bar is deliberately throughput-shaped rather than "anything finished":
+    an attempt that completed at least ``rollout_batch_size`` candidate groups
+    proved the fleet can produce a batch's worth of samples and merely lost
+    them to the filters, which is what another draw fixes. An attempt that
+    could not even complete that many candidates is throughput-bound, and
+    re-drawing only burns another full deadline on the same bottleneck.
+    """
+
+    def __init__(
+        self, message: str, *, reason: str, valid_groups: int, completed_groups: int, required_groups: int
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.valid_groups = valid_groups
+        self.completed_groups = completed_groups
+        self.required_groups = required_groups
+        self.retryable = reason in RETRYABLE_SHORTFALLS and completed_groups >= required_groups
+
+
+def _insufficient_rollout_batch(args, rollout_id, state, valid_groups, reason, completed_groups=0) -> RuntimeError:
+    return InsufficientRolloutBatch(
+        f"Rollout {rollout_id}: insufficient valid groups ({valid_groups}/{args.rollout_batch_size}); {reason}. "
+        f"submitted_candidate_groups={state.submitted_candidate_groups}, "
+        f"pending_groups={sum(not task.done() for task in state.pendings)}, "
+        f"completed_candidate_groups={completed_groups}, "
+        f"rollout_max_candidate_groups={getattr(args, 'rollout_max_candidate_groups', None)}, "
+        f"rollout_timeout_seconds={getattr(args, 'rollout_timeout_seconds', None)}",
+        reason=reason,
+        valid_groups=valid_groups,
+        completed_groups=completed_groups,
+        required_groups=args.rollout_batch_size,
+    )
+
+
+def _report_rollout_candidates(args, rollout_id, state, data, all_data, filter_outputs, *, error, attempt=1):
+    """Best-effort diagnostics must not replace the original sampling failure."""
+    try:
+        summary = summarize_rollout_candidates(args, all_data, filter_outputs)
+        summary.update(
+            valid_groups=len(data),
+            target_groups=args.rollout_batch_size,
+            submitted_candidate_groups=state.submitted_candidate_groups,
+            pending_groups=sum(not task.done() for task in state.pendings),
+            attempt=attempt,
+        )
+        log = logger.error if error is not None else logger.info
+        # Emit the summary before optional filesystem I/O (e.g. a slow shared mount).
+        log("Rollout %s candidate summary=%s; error=%s", rollout_id, summary, error)
+        path = None
+        try:
+            path = save_rollout_candidate_evidence(
+                args, rollout_id, all_data, filter_outputs, data, summary, error=error, attempt=attempt
+            )
+        except Exception:
+            logger.warning("Rollout %s candidate evidence write failed", rollout_id, exc_info=True)
+        log("Rollout %s candidate evidence_file=%s", rollout_id, path)
+    except Exception:
+        logger.warning("Rollout %s candidate diagnostics failed", rollout_id, exc_info=True)
+
+
+async def _collect_rollout_samples(args, rollout_id, state, data_source, attempt=1):
+    data, all_data, filter_outputs = [], [], []
+    metrics = MetricGatherer()
+    timeout = getattr(args, "rollout_timeout_seconds", None)
+    deadline = asyncio.get_running_loop().time() + timeout if timeout is not None else None
+    collector = asyncio.create_task(
+        _fill_rollout_batch(args, rollout_id, state, data_source, data, all_data, filter_outputs, metrics, deadline)
+    )
+    error = None
+    try:
+        # Unlike wait_for, wait does not wait indefinitely for cancellation handlers.
+        done, _ = await asyncio.wait({collector}, timeout=timeout)
+        if not done:
+            raise _insufficient_rollout_batch(
+                args, rollout_id, state, len(data), "sampling deadline exceeded", len(all_data)
+            )
+        collector.result()
+        return data, all_data, metrics
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        await _cancel_rollout_tasks({collector})
+        # A deadline or sibling exception may leave completed results unconsumed.
+        # Record them without filtering again or admitting them to the train batch.
+        evidence_groups = list(all_data)
+        for task in state.pendings:
+            if task.done() and not task.cancelled() and task.exception() is None:
+                evidence_groups.append(task.result())
+                filter_outputs.append(None)
+        _report_rollout_candidates(
+            args, rollout_id, state, data, evidence_groups, filter_outputs, error=error, attempt=attempt
+        )
+        evidence_groups.clear()
+        filter_outputs.clear()
+        if error is not None:
+            # Do not pin candidate lists in a retained exception traceback.
+            data.clear()
+            all_data.clear()
+
+
+async def _collect_rollout_samples_with_retries(args, rollout_id, state, data_source):
+    """Re-sample a rollout whose candidates fell short, within a fixed attempt budget.
+
+    Only a shortfall is retried, and only when the failed attempt completed at
+    least ``rollout_batch_size`` candidate groups. An exhausted data source, or
+    a throughput-bound attempt, still fails immediately: the retry budget exists
+    to absorb an unlucky accept rate, not to keep a stalled fleet spinning.
+
+    Returns the collector's ``(data, all_data, metrics)`` plus the partial groups
+    that the inter-attempt aborts drained, which the caller must hand back to the
+    data source exactly like the ones its own cleanup abort produces.
+
+    Note the sampling deadline and the candidate-group budget are per attempt, so
+    the worst case for one rollout is ``rollout_max_attempts`` times each.
+    """
+    attempts = max(1, int(getattr(args, "rollout_max_attempts", 1) or 1))
+    retry_aborted_samples: list[list[Sample]] = []
+    previous_completed = None
+    if attempts > 1:
+        timeout = getattr(args, "rollout_timeout_seconds", None)
+        logger.info(
+            "Rollout %s may use up to %s sampling attempts; the deadline and candidate budget are per "
+            "attempt, so the worst case is %s x %ss and %s x %s candidate groups.",
+            rollout_id,
+            attempts,
+            attempts,
+            timeout,
+            attempts,
+            getattr(args, "rollout_max_candidate_groups", None),
+        )
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            # In-flight requests from the failed attempt must not bleed into this one.
+            # A cleanup failure here is incidental: it must neither replace the shortfall
+            # we diagnosed nor consume the remaining attempts.
+            try:
+                retry_aborted_samples.extend(await abort(args, rollout_id))
+            except BaseException:
+                logger.warning(
+                    "Rollout %s attempt %s abort failed; continuing with a reset state",
+                    rollout_id,
+                    attempt,
+                    exc_info=True,
+                )
+            state.reset()
+        try:
+            data, all_data, metrics = await _collect_rollout_samples(
+                args, rollout_id, state, data_source, attempt=attempt
+            )
+            return data, all_data, metrics, retry_aborted_samples
+        except InsufficientRolloutBatch as exc:
+            if attempt >= attempts or not exc.retryable:
+                raise
+            # A collapse between attempts means the fleet is failing, not unlucky. The bar is
+            # deliberately far below "any decrease": sampling throughput varies by a few groups
+            # between identical attempts, and treating that as degradation throws away the
+            # retries the operator asked for.
+            if (
+                previous_completed is not None
+                and exc.completed_groups * 2 < previous_completed
+            ):
+                logger.error(
+                    "Rollout %s attempt %s completed less than half the candidate groups of attempt %s "
+                    "(%s < %s); the fleet is collapsing, not unlucky. Not retrying.",
+                    rollout_id,
+                    attempt,
+                    attempt - 1,
+                    exc.completed_groups,
+                    previous_completed,
+                )
+                raise
+            previous_completed = exc.completed_groups
+            logger.warning(
+                "Rollout %s attempt %s/%s fell short (%s/%s valid groups, %s completed candidates); "
+                "retrying: %s",
+                rollout_id,
+                attempt,
+                attempts,
+                exc.valid_groups,
+                args.rollout_batch_size,
+                exc.completed_groups,
+                exc.reason,
+            )
+    raise AssertionError("rollout retry loop must return or raise")
+
+
+async def _fill_rollout_batch(args, rollout_id, state, data_source, data, all_data, filter_outputs, metrics, deadline):
+    def check_deadline():
+        if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+            raise _insufficient_rollout_batch(
+                args, rollout_id, state, len(data), "sampling deadline exceeded", len(all_data)
+            )
+
+    await dumper_utils.configure_sglang(args)
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path else None
+    max_groups = getattr(args, "rollout_max_candidate_groups", None)
+    target = args.rollout_batch_size
+    do_print = True
+    pbar = tqdm(total=target * args.n_samples_per_prompt, desc="Rollout generation")
+    try:
+        while len(data) < target:
+            check_deadline()
+            while state.remaining_batch_size < target:
+                check_deadline()
+                request_size = args.over_sampling_batch_size
+                if max_groups is not None:
+                    request_size = min(request_size, max_groups - state.submitted_candidate_groups)
+                    if request_size <= 0:
+                        break
+                samples = data_source(request_size)
+                check_deadline()
+                if max_groups is not None:
+                    samples = samples[:request_size]
+                if not samples:
+                    raise _insufficient_rollout_batch(
+                        args, rollout_id, state, len(data), "data source returned no groups", len(all_data)
+                    )
+                state.submit_generate_tasks(samples)
+
+            # Exhausting the submission budget does not discard in-flight groups.
+            if not state.pendings:
+                raise _insufficient_rollout_batch(
+                    args, rollout_id, state, len(data), "candidate group budget exhausted", len(all_data)
+                )
+            done, _ = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+            check_deadline()
+            for task in done:
+                # Keep unconsumed completed siblings tracked for exception cleanup.
+                state.pendings.remove(task)
+                group = task.result()
+                if do_print:
+                    sample = group[0][0] if isinstance(group[0], list) else group[0]
+                    logger.info(
+                        "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
+                        sample_text_preview(sample),
+                        str(sample.label)[:100],
+                        reward_log_summary(sample.reward),
+                    )
+                    do_print = False
+                assert len(group) == args.n_samples_per_prompt
+                all_data.append(group)
+                filter_outputs.append(None)
+                filter_output = apply_preput_filters(args, dynamic_filter, group)
+                filter_outputs[-1] = filter_output
+                if not filter_output.keep:
+                    metrics.on_dynamic_filter_drop(reason=filter_output.reason)
+                check_deadline()
+                if not filter_output.keep:
+                    state.remaining_batch_size -= 1
+                    continue
+                if len(data) < target:
+                    data.append(group)
+                    pbar.update(args.n_samples_per_prompt)
+    finally:
+        pbar.close()
 
 
 async def generate_rollout_async(
@@ -456,80 +753,44 @@ async def generate_rollout_async(
             - aborted_samples: any partial groups collected during abort when partial_rollout is enabled
     """
     assert args.rollout_global_dataset
-
-    await dumper_utils.configure_sglang(args)
-
     state = GenerateState(args)
-
-    # instantiate data filters
-    dynamic_filter = (
-        load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
-    )
-
-    metric_gatherer = MetricGatherer()
-
-    # target_data_size is the total number of valid samples to get
-    target_data_size = args.rollout_batch_size
-
-    data = []
-    all_data = []
-    do_print = True
-    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
-    while len(data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
-            # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
-            state.submit_generate_tasks(samples)
-
-        # wait for the generation to finish
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            group: list[Sample] = task.result()
-
-            if do_print:
-                sample = group[0][0] if isinstance(group[0], list) else group[0]
-                logger.info(
-                    "First rollout sample: text_preview=%s, label=%s, reward_summary=%s",
-                    sample_text_preview(sample),
-                    str(sample.label)[:100],
-                    reward_log_summary(sample.reward),
-                )
-                do_print = False
-
-            assert len(group) == args.n_samples_per_prompt
-            all_data.append(group)
-            filter_output = apply_preput_filters(args, dynamic_filter, group)
-            if not filter_output.keep:
-                metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
-                state.remaining_batch_size -= 1
-                continue
-
-            # add the samples to the data
-            # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size:
-                data.append(group)
-                pbar.update(args.n_samples_per_prompt)
-
-    pbar.close()
-    sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
-    logger.info(
-        "Finish rollout: text_preview=%s, label=%s, reward_summary=%s",
-        sample_text_preview(sample),
-        str(sample.label)[:100],
-        reward_log_summary(sample.reward),
-    )
-
-    # there are still some unfinished requests, abort them
-    aborted_samples = await abort(args, rollout_id)
+    # Budgets and task ownership belong to one outer rollout, not to the filter.
+    state.reset()
+    abort_started = False
+    try:
+        data, all_data, metric_gatherer, retry_aborted_samples = await _collect_rollout_samples_with_retries(
+            args, rollout_id, state, data_source
+        )
+        sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
+        logger.info(
+            "Finish rollout: valid_groups=%s, submitted_candidate_groups=%s, "
+            "text_preview=%s, label=%s, reward_summary=%s",
+            len(data),
+            state.submitted_candidate_groups,
+            sample_text_preview(sample),
+            str(sample.label)[:100],
+            reward_log_summary(sample.reward),
+        )
+        abort_started = True
+        # Groups drained by an inter-attempt abort are owed to the data source just
+        # like these; dropping them would silently burn their prompts and tokens.
+        aborted_samples = retry_aborted_samples + await abort(args, rollout_id)
+    except BaseException:
+        if not abort_started:
+            try:
+                await abort(args, rollout_id)
+            except BaseException:
+                logger.warning("Rollout %s cleanup failed; preserving original exception", rollout_id, exc_info=True)
+        raise
+    finally:
+        # Also reset on failure so a later rollout/eval cannot inherit the budget.
+        state.reset()
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
     all_samples = sorted(
         all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
     )
-
-    # reset the global state to prevent effects on the next rollout or eval.
-    state.reset()
     if (x := args.rollout_sample_filter_path) is not None:
         filter_func = load_function(x)
         filter_func(args, data)

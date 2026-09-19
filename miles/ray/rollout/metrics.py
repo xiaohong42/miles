@@ -15,7 +15,7 @@ from miles.utils.metric_utils import (
     has_repetition,
 )
 from miles.utils.tracking_utils import tracking
-from miles.utils.types import AdapterRef, Sample
+from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -136,13 +136,12 @@ def _compute_metrics_from_samples(args, samples):
     return log_dict
 
 
-def _get_rollout_key(sample: Sample, position: int) -> tuple[AdapterRef | None, str, int | None, int]:
-    # Adapter identity scopes the IDs because each Multi-LoRA data source numbers them independently.
+def _get_rollout_key(sample: Sample, position: int) -> tuple[str, int | None, int]:
     if sample.rollout_id is not None:
-        return (sample.adapter, "rollout", sample.group_index, sample.rollout_id)
+        return ("rollout", sample.group_index, sample.rollout_id)
     if sample.index is not None:
-        return (sample.adapter, "sample", sample.group_index, sample.index)
-    return (sample.adapter, "position", sample.group_index, position)
+        return ("sample", sample.group_index, sample.index)
+    return ("position", sample.group_index, position)
 
 
 def _compute_episode_response_length_metrics(samples: list[Sample]) -> dict[str, float]:
@@ -153,11 +152,8 @@ def _compute_episode_response_length_metrics(samples: list[Sample]) -> dict[str,
     computing batch-level statistics. Effective lengths count only trainable
     tokens; total lengths count both masked and unmasked tokens in every sample.
     """
-    if any(sample.adapter is not None for sample in samples):
-        return {}
-
-    effective_lengths_by_rollout: dict[tuple[AdapterRef | None, str, int | None, int], int] = {}
-    total_lengths_by_rollout: dict[tuple[AdapterRef | None, str, int | None, int], int] = {}
+    effective_lengths_by_rollout: dict[tuple[str, int | None, int], int] = {}
+    total_lengths_by_rollout: dict[tuple[str, int | None, int], int] = {}
     for position, sample in enumerate(samples):
         rollout_key = _get_rollout_key(sample, position)
         effective_response_length = 0 if sample.remove_sample else sample.effective_response_length
@@ -183,10 +179,9 @@ def _compute_training_sample_metrics(args: Any, samples: list[Sample]) -> dict[s
     Session compaction can turn one rollout into several training samples. The
     sample count includes every resulting row, while the reward first averages
     sibling rows that share a rollout ID so long rollouts do not receive more
-    metric weight merely because they produced more samples. Adapter identity
-    scopes these IDs because each Multi-LoRA data source numbers them independently.
+    metric weight merely because they produced more samples.
     """
-    rewards_by_rollout: dict[tuple[AdapterRef | None, str, int | None, int], list[float]] = {}
+    rewards_by_rollout: dict[tuple[str, int | None, int], list[float]] = {}
     use_metadata_reward = bool(samples and samples[0].metadata and "raw_reward" in samples[0].metadata)
     for position, sample in enumerate(samples):
         rollout_key = _get_rollout_key(sample, position)
@@ -247,18 +242,22 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
     interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
 
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
-
-    counts = {reward: len(items) for reward, items in group_by(interesting_rewards).items()}
+    interesting_rewards = [g[0].get_reward_value(args) for g in interesting_sample_groups]
+    # Normalize int/float/bool and signed zero for display only. Rounded buckets
+    # must not define exact endpoint rates (e.g. 0.04 is not a zero reward).
+    reward_buckets = [str(round(float(reward), 1) + 0.0) for reward in interesting_rewards]
+    counts = {reward: len(items) for reward, items in group_by(reward_buckets).items()}
     log_dict = {f"zero_std/count_{reward}": count for reward, count in counts.items()}
 
-    # Percentages over total groups, so "too hard" (all-0) and "too easy"
-    # (all-1) rates are comparable across runs without needing to know the
-    # rollout batch size.
+    # All rates use total prompt groups as the denominator. Endpoint names are
+    # numeric, not accuracy claims: DAPO scores use -1/+1 rather than 0/1.
     total_groups = len(all_sample_groups)
     if total_groups > 0:
-        log_dict["zero_std/all_zero_percentage"] = counts.get("0.0", 0) / total_groups
-        log_dict["zero_std/all_one_percentage"] = counts.get("1.0", 0) / total_groups
+        log_dict["zero_std/percentage"] = len(interesting_sample_groups) / total_groups
+        for name, value in (("zero", 0), ("one", 1), ("negative_one", -1)):
+            log_dict[f"zero_std/all_{name}_percentage"] = (
+                sum(reward == value for reward in interesting_rewards) / total_groups
+            )
 
     return log_dict
 

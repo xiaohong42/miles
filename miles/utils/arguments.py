@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -72,6 +73,21 @@ def _resolve_rollout_functions(args) -> None:
 
     user_eval_path = args.eval_function_path
     args.rollout_function_path, args.eval_function_path = resolve_rollout_function_paths(args)
+    if (
+        (
+            any(
+                getattr(args, name, None) is not None
+                for name in ("rollout_max_candidate_groups", "rollout_timeout_seconds")
+            )
+            or (getattr(args, "rollout_max_attempts", 1) or 1) > 1
+        )
+        and args.rollout_function_path != "miles.rollout.sglang_rollout.generate_rollout"
+    ):
+        raise ValueError(
+            "--rollout-max-candidate-groups, --rollout-timeout-seconds and --rollout-max-attempts require "
+            "--rollout-function-path miles.rollout.sglang_rollout.generate_rollout "
+            "(or MILES_USE_LEGACY_ROLLOUT_V1=1); other rollout implementations do not enforce these budgets"
+        )
     # An inherited eval path is the rollout fn serving eval itself, never a checkpoint
     # backend: skip the resolve so custom rollout modules are not imported on the driver.
     checkpoint_backend = user_eval_path is not None and is_checkpoint_eval_fn(args.eval_function_path)
@@ -104,6 +120,8 @@ _DEFAULT_FT_API_SERVER_PORT = 18080
 
 def get_miles_extra_args_provider(add_custom_arguments=None):
     def add_miles_arguments(parser):
+        parser.set_defaults(entry="train")
+
         def add_run_uuid_arguments(parser):
             parser.add_argument(
                 "--run-uuid",
@@ -299,11 +317,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
 
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
-            reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
+            reset_arg(parser, "--distributed-timeout-minutes", type=int, default=60)
 
             return parser
 
         def add_train_arguments(parser):
+            from miles.backends.megatron_utils.optimizer_cpu_streaming_gradients import (
+                add_optimizer_cpu_streaming_gradients_argument,
+            )
+
+            add_optimizer_cpu_streaming_gradients_argument(parser)
             parser.add_argument(
                 "--train-backend",
                 type=str,
@@ -663,6 +686,53 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "Regardless of whether partial rollout is used or filters are applied, "
                     "the sampling granularity is always determined by this value. "
                     "If this value is None, rollout_batch_size will be used as the default over_sampling_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-max-candidate-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum candidate prompt groups submitted per legacy sglang_rollout training rollout "
+                    "attempt, including in-flight and filtered groups. None disables the limit. "
+                    "Already submitted groups may finish; fail if they cannot fill rollout_batch_size. "
+                    "With --rollout-max-attempts N the per-rollout worst case is N times this."
+                ),
+            )
+            parser.add_argument(
+                "--max-consecutive-zero-grad-steps",
+                type=int,
+                default=0,
+                help=(
+                    "Exit after this many consecutive optimizer steps whose reduced gradient norm is "
+                    "exactly zero. Reward-variance filters do not guarantee a non-zero parameter "
+                    "gradient, so this is the separate protection for a silently dead backward. "
+                    "0 disables the check."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-max-attempts",
+                type=int,
+                default=1,
+                help=(
+                    "How many times one legacy sglang_rollout training rollout may re-sample after "
+                    "falling short of rollout_batch_size valid groups. 1 keeps the fail-fast behaviour. "
+                    "Only a shortfall is retried, and only when the failed attempt still completed at "
+                    "least rollout_batch_size candidate groups: an exhausted data source, or a "
+                    "throughput-bound attempt, fails immediately. Each attempt gets a FRESH "
+                    "--rollout-timeout-seconds deadline and --rollout-max-candidate-groups budget, so "
+                    "the worst case for one rollout is this many times each."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-timeout-seconds",
+                type=float,
+                default=None,
+                help=(
+                    "Wall-clock sampling deadline per legacy sglang_rollout training rollout attempt, "
+                    "including waiting. None disables the deadline. An incomplete batch raises an error "
+                    "rather than training. Abort and cancellation have a separate bounded cleanup grace "
+                    "period. With --rollout-max-attempts N the per-rollout worst case is N times this."
                 ),
             )
             parser.add_argument(
@@ -1031,6 +1101,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Number of rollout steps. If not set, we will calculate the number of rollout steps from the dataset size.",
             )
             parser.add_argument(
+                "--continuous-rollout",
+                action="store_true",
+                help=(
+                    "Keep the synchronous Megatron training loop running until interrupted. "
+                    "num-rollout remains a positive scheduler initialization horizon, not a stop condition. "
+                    "Requires constant learning-rate/weight-decay schedules; per-rollout budgets still apply."
+                ),
+            )
+            parser.add_argument(
                 "--debug-exit-after-rollout",
                 type=int,
                 default=None,
@@ -1127,10 +1206,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rollout-batch-size",
                 type=int,
-                required=True,
+                default=None,
                 help=(
                     "The number of prompts in each rollout step. "
                     "The total data returned should be rollout_batch_size * n_samples_per_prompt. "
+                    "Required for the train entry. "
                 ),
             )
             parser.add_argument(
@@ -1840,78 +1920,6 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=0,
                 help="Maximum number of concurrent adapter slots for multi-LoRA. Set to 0 to disable multi-LoRA (default: 0)",
-            )
-            parser.add_argument(
-                "--multi-lora-adapter",
-                nargs=2,
-                action="append",
-                type=str,
-                dest="multi_lora_adapters",
-                default=[],
-            )
-            parser.add_argument(
-                "--multi-lora-idle-poll-s",
-                type=float,
-                default=5.0,
-                help="When no adapter is RUNNING, the trainer polls for new registrations every this many seconds (default: 5.0)",
-            )
-            parser.add_argument(
-                "--multi-lora-http-server-path",
-                type=str,
-                default=None,
-                help=(
-                    "Dotted path to a MultiLoRAHTTPServer subclass to use for the multi-LoRA "
-                    "controller's HTTP server (default: MultiLoRAHTTPServer)"
-                ),
-            )
-            parser.add_argument(
-                "--multi-lora-backend-path",
-                type=str,
-                default=None,
-                help=(
-                    "Dotted path to a MultiLoRABackend subclass for the multi-LoRA controller, "
-                    "e.g. to add custom adapter validation via validate_adapter (default: MultiLoRABackend)"
-                ),
-            )
-            parser.add_argument(
-                "--multi-lora-api-port",
-                type=int,
-                default=8068,
-                help="Port for the multi-LoRA controller's control-plane API, served from the head node (default: 8068)",
-            )
-            parser.add_argument(
-                "--multi-lora-disable-service-mode",
-                action="store_false",
-                dest="multi_lora_service_mode",
-                help="Disable service mode. By default, the trainer waits indefinitely for new adapters. With this flag, it exits after all adapters have been processed.",
-            )
-            parser.add_argument(
-                "--multi-lora-max-adapter-global-batch-size",
-                type=int,
-                default=None,
-                help=(
-                    "Registration-time upper bound on an adapter's samples per optimizer "
-                    "step (rollout_batch_size x n_samples_per_prompt). Defaults to 4x "
-                    "--global-batch-size."
-                ),
-            )
-            parser.add_argument(
-                "--multi-lora-max-coalesce-wait-s",
-                type=float,
-                default=0.5,
-                help=(
-                    "Maximum time ready groups wait for the batch to fill toward "
-                    "--global-batch-size before training starts on what is ready (default: 0.5)."
-                ),
-            )
-            parser.add_argument(
-                "--multi-lora-max-empty-wait-s",
-                type=float,
-                default=30.0,
-                help=(
-                    "How long a generate call waits for the first poppable group before "
-                    "failing with an empty-batch timeout (default: 30)."
-                ),
             )
             return parser
 
@@ -2722,7 +2730,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
     return add_miles_arguments
 
 
-def parse_args(add_custom_arguments=None):
+def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
+    assert entry in ("train", "serve"), f"unknown entry {entry!r}"
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     configure_logger_raw("main")
 
@@ -2766,6 +2775,9 @@ def parse_args(add_custom_arguments=None):
     # locates the per-test record). No CLI flag: non-CI runs always stay False.
     args.ci_enable_metrics_capture = bool(os.environ.get(RECORD_DIR_ENV))
 
+    args.entry = entry
+    if preprocess_args is not None:
+        preprocess_args(args)
     miles_validate_args(args)
 
     if backend == "megatron":
@@ -2871,7 +2883,7 @@ def _validate_rematerialize_param_from_master_weight(args):
     assert (
         args.train_backend == "megatron"
     ), "--rematerialize-param-from-master-weight reads Megatron's distributed-optimizer main params"
-    from miles.backends.megatron_utils.lora_utils import is_lora_enabled
+    from miles.backends.megatron_utils.lora.utils import is_lora_enabled
 
     assert not is_lora_enabled(args), "--rematerialize-param-from-master-weight does not support LoRA"
     assert not args.debug_disable_optimizer, "--debug-disable-optimizer leaves no main params to rematerialize from"
@@ -2918,6 +2930,51 @@ def _resolve_mini_ft_controller_enable(args: argparse.Namespace) -> bool:
     return bool(args.ft_components) and args.api_server_port != 0
 
 
+def validate_rollout_sampling_budgets(args) -> None:
+    max_groups = getattr(args, "rollout_max_candidate_groups", None)
+    timeout = getattr(args, "rollout_timeout_seconds", None)
+    attempts = getattr(args, "rollout_max_attempts", 1)
+    if max_groups is not None and (not isinstance(max_groups, int) or max_groups <= 0):
+        raise ValueError("--rollout-max-candidate-groups must be a positive integer")
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError("--rollout-timeout-seconds must be finite and positive")
+    # Bounded on purpose: an unbounded budget would turn a dead fleet into an idle loop.
+    if attempts is not None and (not isinstance(attempts, int) or not 1 <= attempts <= 10):
+        raise ValueError("--rollout-max-attempts must be an integer between 1 and 10")
+    zero_grad = getattr(args, "max_consecutive_zero_grad_steps", 0)
+    if zero_grad is not None and (not isinstance(zero_grad, int) or zero_grad < 0):
+        raise ValueError("--max-consecutive-zero-grad-steps must be a non-negative integer")
+    # Only the Megatron train loop observes the reduced grad norm; anywhere else the
+    # flag would read as protection the run does not actually have.
+    if zero_grad and getattr(args, "train_backend", "megatron") != "megatron":
+        raise ValueError(
+            "--max-consecutive-zero-grad-steps requires --train-backend megatron; "
+            "other training backends do not observe the reduced gradient norm"
+        )
+    # Megatron only computes a grad norm when it clips; without clipping the norm is a
+    # constant sentinel, which the watchdog would read as a permanently dead backward.
+    if zero_grad and getattr(args, "clip_grad", 1.0) <= 0:
+        raise ValueError(
+            "--max-consecutive-zero-grad-steps requires --clip-grad > 0; the optimizer only "
+            "reports a gradient norm when clipping is enabled"
+        )
+
+
+def validate_continuous_rollout(args) -> None:
+    if not getattr(args, "continuous_rollout", False):
+        return
+    if args.train_backend != "megatron" or args.fully_async:
+        raise ValueError("--continuous-rollout requires the synchronous Megatron driver")
+    if args.num_rollout is None or args.num_rollout <= 0:
+        raise ValueError("--continuous-rollout requires a positive --num-rollout scheduler horizon")
+    if args.lr_decay_style != "constant" or args.weight_decay_incr_style != "constant":
+        raise ValueError("--continuous-rollout requires constant learning-rate and weight-decay schedules")
+    if args.lr_warmup_fraction is not None:
+        raise ValueError("--continuous-rollout requires an explicit warmup iteration count, not a fraction")
+    if args.debug_exit_after_rollout is not None or args.debug_train_only or args.debug_rollout_only:
+        raise ValueError("--continuous-rollout does not allow debug stop/partial-training modes")
+
+
 def miles_validate_args(args):
     if args.custom_config_path:
         data = yaml.safe_load(resolve_file_arg(args.custom_config_path)) or {}
@@ -2927,6 +2984,8 @@ def miles_validate_args(args):
             setattr(args, k, v)
 
     validate_dashboard_args(args)
+    validate_rollout_sampling_budgets(args)
+    validate_continuous_rollout(args)
 
     args.ft_components = _resolve_ft_components(args)
     assert not ("rollout" in args.ft_components and args.eval_num_gpus > 0), (
@@ -3030,9 +3089,8 @@ def miles_validate_args(args):
         )
         args.chat_template_path = None
 
-    # A named family is one fixed renderer contract.  Letting a custom path or
-    # conflicting required kwarg through would detach its declared role
-    # capability from the renderer that actually runs.
+    # Named families require their registered template and fixed kwargs to keep
+    # the renderer consistent with the roles they support.
     if args.tito_model != TITOTokenizerType.DEFAULT.value:
         tito_model = TITOTokenizerType(args.tito_model)
         from miles.utils.chat_template_utils import resolve_fixed_chat_template
@@ -3047,13 +3105,7 @@ def miles_validate_args(args):
         if resolved_path is not None:
             args.chat_template_path = resolved_path
         user_kwargs = dict(args.apply_chat_template_kwargs or {})
-        for key, value in resolved_kwargs.items():
-            if key in user_kwargs and user_kwargs[key] != value:
-                raise ValueError(
-                    f"--apply-chat-template-kwargs {key}={user_kwargs[key]!r} conflicts "
-                    f"with the value registered for --tito-model={tito_model.value}: {value!r}"
-                )
-            user_kwargs[key] = value
+        user_kwargs.update(resolved_kwargs)
         args.apply_chat_template_kwargs = user_kwargs
 
     if args.chat_template_path is not None:
@@ -3558,27 +3610,30 @@ def miles_validate_args(args):
         args.grpo_std_normalization = False
         logger.info("n_samples_per_prompt is set to 1, grpo_std_normalization will be set to False.")
 
-    if args.over_sampling_batch_size is None:
-        args.over_sampling_batch_size = args.rollout_batch_size
+    if args.entry == "train":
+        assert args.rollout_batch_size is not None, "please set --rollout-batch-size"
 
-    assert args.over_sampling_batch_size >= args.rollout_batch_size, (
-        f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
-        f"rollout_batch_size {args.rollout_batch_size}"
-    )
+        if args.over_sampling_batch_size is None:
+            args.over_sampling_batch_size = args.rollout_batch_size
 
-    if args.num_epoch is not None:
-        if args.num_rollout is not None:
-            logger.info("Both num_epoch and num_rollout are set, num_epoch will be ignored.")
-        else:
-            assert args.rollout_global_dataset, (
-                "num_epoch is set, but rollout_global_dataset is not set, "
-                "please remove --disable-rollout-global-dataset to use num_epoch"
-            )
-    else:
-        # if num_epoch is not set, we should set num_rollout
-        assert args.num_rollout is not None, (
-            "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
+        assert args.over_sampling_batch_size >= args.rollout_batch_size, (
+            f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
+            f"rollout_batch_size {args.rollout_batch_size}"
         )
+
+        if args.num_epoch is not None:
+            if args.num_rollout is not None:
+                logger.info("Both num_epoch and num_rollout are set, num_epoch will be ignored.")
+            else:
+                assert args.rollout_global_dataset, (
+                    "num_epoch is set, but rollout_global_dataset is not set, "
+                    "please remove --disable-rollout-global-dataset to use num_epoch"
+                )
+        else:
+            # if num_epoch is not set, we should set num_rollout
+            assert args.num_rollout is not None, (
+                "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
+            )
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
