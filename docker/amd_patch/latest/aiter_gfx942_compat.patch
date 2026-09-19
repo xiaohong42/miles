@@ -1,0 +1,44 @@
+diff --git a/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py b/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py
+index a4082b120..ad9167fa1 100644
+--- a/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py
++++ b/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py
+@@ -4,7 +4,7 @@
+ 
+ from __future__ import annotations
+ 
+-from functools import lru_cache
++from functools import cache
+ 
+ import flydsl.compiler as flyc
+ import flydsl.expr as fx
+@@ -606,7 +606,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
+ # ============================================================================
+ 
+ 
+-@lru_cache(maxsize=32)
++@cache
+ def compile_pa_mqa_logits_fp4_prefill(
+     *,
+     block_k: int = 256,
+diff --git a/csrc/cpp_itfs/torch_utils.py b/csrc/cpp_itfs/torch_utils.py
+index 39b485fb1..489ca6467 100644
+--- a/csrc/cpp_itfs/torch_utils.py
++++ b/csrc/cpp_itfs/torch_utils.py
+@@ -54,8 +54,15 @@ def torch_to_c_types(*args):
+             c_args.append(ctypes.POINTER(ctypes.c_int)())
+         elif isinstance(arg, torch.Tensor):
+             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
+-        elif isinstance(arg, torch.cuda.Stream):
+-            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
++        elif isinstance(arg, torch.Stream):
++            handle = getattr(arg, "cuda_stream", None)
++            if handle is None:
++                handle = torch.cuda.Stream(
++                    stream_id=arg.stream_id,
++                    device_index=arg.device_index,
++                    device_type=arg.device_type,
++                ).cuda_stream
++            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
+         else:
+             if type(arg) not in ctypes_map:
+                 raise ValueError(f"Unsupported type: {type(arg)}")
