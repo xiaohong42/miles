@@ -116,6 +116,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
         metadata={
             "help": (
                 "fp8_smoke: 2-node FP8, target 2 x 4 samples, oversampling 8 groups (32 initial requests); "
+                "up to 3 sampling attempts per rollout; exits after 3 consecutive zero-gradient steps; "
                 "strict completed reward diversity, max 32 candidate groups / 1800 seconds."
             )
         },
@@ -636,6 +637,9 @@ def _train(args: ScriptArgs, *, fp8_recipe: str | None = None):
         rollout_args += (
             "--rollout-function-path miles.rollout.sglang_rollout.generate_rollout "
             "--over-sampling-batch-size 8 --rollout-max-candidate-groups 32 --rollout-timeout-seconds 1800 "
+            # A round that falls short is unlucky, not fatal; a round that completes
+            # nothing, or a dead backward, still stops the job and keeps the evidence.
+            "--rollout-max-attempts 3 --max-consecutive-zero-grad-steps 3 "
             "--continuous-rollout "
             "--dynamic-sampling-filter-path "
             "miles.rollout.filter_hub.truncated_response_filters.mask_truncated_and_require_completed_reward_diversity "
