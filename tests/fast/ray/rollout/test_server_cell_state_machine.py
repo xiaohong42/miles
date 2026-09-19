@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 import pytest
-from tests.fast.ray.rollout.conftest import dispose_tracked_server_cells, make_args, track_server_cell
+from tests.fast.ray.rollout.conftest import make_args, track_server_cell
 
 from miles.ray.rollout import server_cell as server_cell_module
 from miles.ray.rollout.cell_state import (
@@ -16,8 +16,6 @@ from miles.ray.rollout.cell_state import (
 )
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
 
-# Keep teardown discoverable when CI collects explicit files without conftest.
-_ = dispose_tracked_server_cells
 pytestmark = pytest.mark.usefixtures("dispose_tracked_server_cells")
 
 _ADDR_INFO = CellAddrInfo(
