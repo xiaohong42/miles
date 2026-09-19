@@ -91,6 +91,95 @@ class TestBuildCpuPytestCmd:
         assert cmd[0] == "pytest"
         assert "tests/fast/a.py" in cmd and "tests/fast/b.py" in cmd
 
+    def test_files_are_sorted_without_mutating_selection(self):
+        files = ["tests/fast/ray/test_a.py", "tests/fast/test_b.py", "tests/fast/ray/test_c.py"]
+        original = files.copy()
+        cmd = build_cpu_pytest_cmd(files, continue_on_error=False)
+        assert cmd == ["pytest", *sorted(original), "-v", "-x"]
+        assert files == original
+
+    @pytest.mark.parametrize("pyargs", [False, True])
+    @pytest.mark.parametrize("continue_on_error", [False, True])
+    def test_nested_conftest_fixtures_keep_scope_and_teardown(self, tmp_path, pyargs, continue_on_error):
+        # A duration-ordered CPU partition can visit child -> parent -> child.
+        # pytest 9.1 then recreates the child's Directory collector, losing both
+        # explicit and autouse fixtures bound to the original collector.
+        # Exercise the actual command builder in a dependency-free subprocess.
+        files = {
+            "pytest.ini": "[pytest]\naddopts = " + ("--pyargs" if pyargs else "") + "\n",
+            "suite/__init__.py": "",
+            "suite/rollout/__init__.py": "",
+            "state.py": "original = object()\ninstance = original\nevents = []\ncalls = 0\n",
+            "suite/rollout/conftest.py": (
+                "import pytest\n"
+                "import state\n"
+                "@pytest.fixture(autouse=True)\n"
+                "def reset_instance(monkeypatch):\n"
+                "    monkeypatch.setattr(state, 'instance', None)\n"
+                "    state.events.append('setup')\n"
+                "    yield\n"
+                "    state.events.append('teardown')\n"
+                "@pytest.fixture\n"
+                "def local_fixture():\n"
+                "    return 42\n"
+            ),
+            "suite/rollout/test_a.py": (
+                "import state\n"
+                "def test_explicit(local_fixture):\n"
+                "    state.calls += 1\n"
+                "    assert local_fixture == 42\n"
+                "    assert state.instance is None\n"
+                "    state.instance = object()\n"
+            ),
+            "suite/test_middle.py": (
+                "import pytest\n"
+                "import state\n"
+                "def test_scope_and_teardown(request):\n"
+                "    assert state.instance is state.original\n"
+                "    assert state.events == ['setup', 'teardown'] * state.calls\n"
+                "    assert 'reset_instance' not in request.fixturenames\n"
+                "    with pytest.raises(pytest.FixtureLookupError):\n"
+                "        request.getfixturevalue('local_fixture')\n"
+            ),
+            "suite/rollout/test_b.py": (
+                "import pytest\n"
+                "import state\n"
+                "def test_late_explicit(local_fixture):\n"
+                "    state.calls += 1\n"
+                "    assert local_fixture == 42\n"
+                "@pytest.mark.parametrize('value', [1, 2])\n"
+                "def test_singleton(value):\n"
+                "    state.calls += 1\n"
+                "    assert state.instance is None, 'already initialized'\n"
+                "    state.instance = value\n"
+            ),
+            "suite/rollout/test_unselected.py": "raise AssertionError('must not collect unselected files')\n",
+        }
+        for name, content in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        command = build_cpu_pytest_cmd(
+            ["suite/rollout/test_a.py", "suite/test_middle.py", "suite/rollout/test_b.py"],
+            continue_on_error=continue_on_error,
+        )
+        env = os.environ.copy()
+        env.pop("PYTEST_ADDOPTS", None)
+        env.pop("PYTEST_PLUGINS", None)
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        env["PYTHONPATH"] = str(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", *command],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "5 passed" in result.stdout
+
 
 # --- CI_SUITES locked to the stage taxonomy ---------------------------------
 

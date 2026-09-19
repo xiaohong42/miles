@@ -199,7 +199,11 @@ def build_cpu_pytest_cmd(filenames: list[str], continue_on_error: bool) -> list[
     `-x` so every file runs; pytest still exits non-zero if any failed, so the
     stage stays red.
     """
-    cmd = ["pytest", *filenames, "-v"]
+    # LPT partitioning orders files by duration, interleaving parent/child
+    # directories. In pytest 9.1, revisiting a directory can create a new
+    # collector while its conftest fixtures remain bound to the old one.
+    # Keep each subtree contiguous without changing selection or fixture scope.
+    cmd = ["pytest", *sorted(filenames), "-v"]
     if not continue_on_error:
         cmd.append("-x")
     return cmd

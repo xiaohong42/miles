@@ -9,6 +9,56 @@ Supports:
                                   smoke testing. **Cannot generate meaningful output -
                                   pipeline-only sanity check.**
 
+Args:
+  --fp8-recipe auto|blockwise|tensorwise: TE training recipe (default: auto).
+      Auto preserves blockwise when TE supports it; on gfx942 it can select
+      tensorwise E4M3 (Float8CurrentScaling). Unsupported explicit recipes fail
+      before Ray submission. This does not change the rollout checkpoint format.
+  --no-fp8-training: explicitly disable FP8 training; never an automatic fallback.
+  --profile default|fp8_smoke: opt into the full-model, 192 GB small-batch recipe.
+      fp8_smoke selects 2 x 8 GPUs, TP1/PP2/CP8/EP8 (22+21 layers), four TP4/EP4
+      rollout engines, and capability-checked tensorwise E4M3 (no BF16 fallback).
+      Default-valued topology/memory/recipe options are replaced by the profile;
+      incompatible non-default values fail early. Eval and fault tolerance are off.
+      It uses opt-in strict final-integer DAPO grading, 2 groups x 4 samples,
+      response length 2048, chat mode, FP32 router, BF16 KV and no SGLang graphs.
+      KV QAT is off to match unified BF16 KV; independent Indexer QAT uses dynamic
+      FP8 scales. TE tensorwise FP8 GEMMs remain enabled. The SGLang FP8 encoder
+      fix must be rebuilt into the AOT binary before use (not merely cherry-picked).
+      CPU AdamW retains FP32 masters/moments and streams one gradient at a time;
+      BF16 model parameters are reconstructed from masters with byte checks.
+      Legacy rollout submits 8 candidate groups x 4 samples initially: 32 requests,
+      or 8 per TP4 engine under round-robin routing. Refill is batched, not a fixed
+      concurrency floor: at most 9 groups / 36 client requests can be outstanding;
+      each engine still runs at most 8 requests. The budget remains 32 candidate
+      groups / 1800 seconds per rollout. Truncated responses are loss-masked without
+      changing rewards; completed responses must have reward diversity. Format
+      penalties are not math errors.
+      --dump-details is opt-in: beside normal successful training dumps, legacy
+      rollout writes candidates/<id>.success.pt or candidates/<id>.failure.pt with
+      completed candidate groups (including rejected ones), text/rewards, filter
+      decisions and summary counts at collection exit. Unfinished requests have
+      no completed evidence. These sidecars are diagnostic-only, not replay inputs;
+      heavy per-token/replay tensors are omitted. Failure summaries always log,
+      including when dumping is disabled. --debug-data-root controls the root.
+      Continuous mode keeps running until interrupted; num_rollout=3000 is only
+      the constant-schedule initialization horizon, NOT a stopping condition.
+      --extra-args allows --num-rollout, --prompt-data, --log-interval, --save-interval,
+      --save-retain-interval, --wandb-project and --wandb-group (last value wins).
+      Profile-owned flags, custom configs/reward hooks and debug/replay shortcuts
+      are rejected before GPU probes; use --profile default for other experiments.
+      Eval/fault-tolerance flags and mode are profile-owned; saving remains opt-in/out
+      through the existing --skip-saving flag (saving is enabled by default).
+      Paths and checkpoint saving use the existing config fields; no audit hooks.
+      Use train with prepared checkpoints/data on every node. The profile requires
+      an already joined external Ray cluster AND --skip-process-cleanup
+      --no-join-ray-workers; it never provisions the cluster.
+
+  Existing Ray (including the default profile): MILES_SCRIPT_EXTERNAL_RAY=1 alone
+  still permits process cleanup. Pass BOTH --skip-process-cleanup and
+  --no-join-ray-workers. Set RAY_ADDRESS to the dashboard URL and MASTER_ADDR to
+  a cluster-reachable training address in the submitting environment (not extra env).
+
 Usage patterns:
 
   1. One-shot full pipeline (download + convert + train):
@@ -26,8 +76,17 @@ Usage patterns:
        python scripts/run_deepseek_v4.py train            --model-name DeepSeek-V4-Flash-FP8 \
            --num-nodes 4 --num-gpus-per-node 8 \
            --hf-checkpoint /root/models/DeepSeek-V4-Flash-FP8
+
+  3. Small-batch full-model FP8 on an existing 2-node cluster (prepared data/model):
+       MILES_SCRIPT_EXTERNAL_RAY=1 RAY_ADDRESS=http://ray-head:8265 \
+       MASTER_ADDR=ray-head NCCL_NVLS_ENABLE=0 \
+       python scripts/amd/run_deepseek_v4.py train --profile fp8_smoke \
+           --skip-process-cleanup --no-join-ray-workers \
+           --model-dir /models --data-dir /datasets --save-dir /checkpoints
 """
 
+import os
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -52,7 +111,21 @@ _MEGATRON_MODEL_TYPE = {
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    profile: Literal["default", "fp8_smoke"] = field(
+        default="default",
+        metadata={
+            "help": (
+                "fp8_smoke: 2-node FP8, target 2 x 4 samples, oversampling 8 groups (32 initial requests); "
+                "strict completed reward diversity, max 32 candidate groups / 1800 seconds."
+            )
+        },
+    )
     mode: Literal["normal", "debug_minimal"] = "debug_minimal"
+    # Context parallelism for the training actor. 1 keeps the historical layout untouched.
+    # Above 1 it is what makes long sequences fit, because it is the only axis that divides
+    # the indexer's [seqlen, seqlen_kv] score matrix -- pipeline parallelism shrinks how many
+    # layers a rank owns but every one of them still allocates the matrix in full.
+    context_parallel_size: int = 1
     run_id: str = U.create_run_id()
     model_org: str = ""
     model_name: Literal[
@@ -61,8 +134,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     ] = "DeepSeek-V4-Flash-FP8"
 
     task: Literal["dapo_aime", "gsm8k"] = "dapo_aime"
+    join_ray_workers: bool = True
+    ray_hostfile: str = "/root/mpi_rack_hostfile"
+    ray_port: int = 6379
     enable_eval: bool = True
     enable_mtp: bool = False
+    colocate_memory_profile: Literal["auto", "192gb", "288gb"] = "auto"
 
     hf_checkpoint: str | None = None
     data_dir: str = "/root/datasets"
@@ -84,7 +161,16 @@ class ScriptArgs(U.ExecuteTrainConfig):
     use_fault_tolerance: bool = True
 
     # debug configs
-    dump_details: bool = False
+    dump_details: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Opt in to debug dumps under --debug-data-root. Legacy rollout also saves completed candidate "
+                "evidence, including rejected groups, in candidates/<id>.success.pt or <id>.failure.pt; "
+                "diagnostic-only, not training/replay input."
+            )
+        },
+    )
     debug_train_run_id: str | None = None
     debug_train_rollout_id: str | None = None
     debug_data_root: str = "/root/shared_data"
@@ -93,15 +179,24 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # precision configs
     enable_r3: bool = True
     train_deterministic: bool = True
-    # Megatron-side training precision: blockwise FP8 128x128 GEMMs (fp32 scales) when True,
-    # BF16 when False. Rollout always serves the source FP8 checkpoint either way.
+    # TE FP8 GEMMs when True, BF16 only when explicitly disabled. Independent of rollout.
     fp8_training: bool = True
+    fp8_recipe: Literal["auto", "blockwise", "tensorwise"] = "auto"
     enable_mis: bool = False
 
-    # pass any extra sglang/miles/megatron args through `--extra-args '--your-arg'`
+    # Default profile accepts arbitrary args; fp8_smoke permits only run/log overrides.
     extra_args: str = ""
 
     def __post_init__(self):
+        if self.profile == "fp8_smoke":
+            _configure_fp8_smoke(self)
+        if self.skip_process_cleanup:
+            if not U.get_bool_env_var("MILES_SCRIPT_EXTERNAL_RAY"):
+                raise ValueError("--skip-process-cleanup requires MILES_SCRIPT_EXTERNAL_RAY=1.")
+            if self.join_ray_workers:
+                raise ValueError(
+                    "--skip-process-cleanup requires --no-join-ray-workers; worker startup cleans processes."
+                )
         if not self.model_org:
             self.model_org = _DEFAULT_MODEL_ORG[self.model_name]
         if self.model_local_dir is None:
@@ -127,6 +222,79 @@ class ScriptArgs(U.ExecuteTrainConfig):
     @property
     def bf16_name(self):
         return f"{self.model_name}-bf16"
+
+
+# Exact names only: an allowlist also prevents argparse abbreviations and custom
+# config files from bypassing the profile's precision/reward/budget contract.
+_FP8_SMOKE_EXTRA_OPTIONS = {
+    "--num-rollout": int,
+    "--prompt-data": str,
+    "--log-interval": int,
+    "--save-interval": int,
+    "--save-retain-interval": int,
+    "--wandb-project": str,
+    "--wandb-group": str,
+}
+
+
+def _validate_fp8_smoke_extra_args(extra_args: str) -> str:
+    tokens = shlex.split(extra_args)
+    remaining = iter(tokens)
+    for token in remaining:
+        option, equals, value = token.partition("=")
+        if option not in _FP8_SMOKE_EXTRA_OPTIONS:
+            raise ValueError(
+                f"--profile fp8_smoke does not allow {option!r} in --extra-args; "
+                f"only {', '.join(_FP8_SMOKE_EXTRA_OPTIONS)} may override the recipe."
+            )
+        value = value if equals else next(remaining, "")
+        if not value or value.startswith("--"):
+            raise ValueError(f"--profile fp8_smoke requires a value for {option}.")
+        if _FP8_SMOKE_EXTRA_OPTIONS[option] is int and (not value.isdecimal() or int(value) <= 0):
+            raise ValueError(f"--profile fp8_smoke requires a positive integer for {option}.")
+    # Preserve argv, not arbitrary shell syntax. Defaults keep their historical text.
+    return shlex.join(tokens)
+
+
+def _configure_fp8_smoke(args: ScriptArgs) -> None:
+    """Resolve this opt-in recipe once, before derived topology or any side effects."""
+    if not U.get_bool_env_var("MILES_SCRIPT_EXTERNAL_RAY"):
+        raise ValueError("--profile fp8_smoke requires MILES_SCRIPT_EXTERNAL_RAY=1 and an existing cluster.")
+    if not args.skip_process_cleanup or args.join_ray_workers:
+        raise ValueError("--profile fp8_smoke requires --skip-process-cleanup --no-join-ray-workers.")
+    required = {
+        "model_name": "DeepSeek-V4-Flash-FP8",
+        "task": "dapo_aime",
+        "num_gpus_per_node": 8,
+        "rollout_num_nodes": 0,
+        "fp8_training": True,
+        "optimizer_offload": True,
+        "enable_mtp": False,
+        "enable_mis": False,
+        "enable_r3": True,
+        "train_deterministic": True,
+        "debug_train_run_id": None,
+        "debug_train_rollout_id": None,
+    }
+    for name, expected in required.items():
+        if getattr(args, name) != expected:
+            raise ValueError(f"--profile fp8_smoke requires {name}={expected!r}.")
+    selections = {
+        "num_nodes": (1, 2),
+        "context_parallel_size": (1, 8),
+        "colocate_memory_profile": ("auto", "192gb"),
+        "fp8_recipe": ("auto", "tensorwise"),
+    }
+    for name, allowed in selections.items():
+        if getattr(args, name) not in allowed:
+            raise ValueError(f"--profile fp8_smoke requires {name}={allowed[1]!r} (or its default).")
+    extra_args = _validate_fp8_smoke_extra_args(args.extra_args)
+    for name, (_, selected) in selections.items():
+        setattr(args, name, selected)
+    args.mode = "normal"
+    args.enable_eval = False
+    args.use_fault_tolerance = False
+    args.extra_args = extra_args
 
 
 def _download_dataset(args: ScriptArgs):
@@ -255,6 +423,63 @@ def _prepare_cp(args: ScriptArgs):
     )
 
 
+def _resolve_colocate_memory_profile(args: ScriptArgs) -> str:
+    """Pick the colocate memory split from the card, not from the node count."""
+    if args.colocate_memory_profile != "auto":
+        return args.colocate_memory_profile
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return "288gb"
+        gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    except Exception:
+        return "288gb"
+    return "288gb" if gib >= 256 else "192gb"
+
+
+def _is_gfx942() -> bool:
+    # Hardware probe is delayed until launch, keeping imports GPU-free.
+    import torch
+
+    return bool(
+        torch.version.hip
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] == "gfx942"
+    )
+
+
+def _cp_derived_layout(
+    total_gpus: int, *, pipeline_size: int, first_layers: int, last_layers: int, cp_size: int
+) -> str:
+    """Spend the tensor-parallel budget on context parallelism, keeping the pipeline split fixed.
+
+    TP = total_gpus / (PP * CP), so DP collapses to 1. EP stays at 8 either way: Megatron builds
+    the expert group from world_size % (etp * ep * pp), a quantity CP does not enter.
+    """
+    if total_gpus % (pipeline_size * cp_size):
+        raise NotImplementedError(
+            f"--context-parallel-size {cp_size} does not divide {total_gpus} GPUs "
+            f"over {pipeline_size} pipeline stages."
+        )
+    tensor_size = total_gpus // (pipeline_size * cp_size)
+    config = f"--tensor-model-parallel-size {tensor_size} "
+    if tensor_size > 1:
+        # Megatron rejects sequence parallelism at TP=1 rather than ignoring it.
+        config += "--sequence-parallel "
+    config += (
+        f"--pipeline-model-parallel-size {pipeline_size} "
+        f"--decoder-first-pipeline-num-layers {first_layers} "
+        f"--decoder-last-pipeline-num-layers {last_layers} "
+        f"--context-parallel-size {cp_size} "
+    )
+    if cp_size > 1:
+        # Mandatory above CP=1: DeepSeek V4 has no zigzag CP path, and arguments.py asserts on
+        # the flag rather than setting it for you.
+        config += "--allgather-cp "
+    return config + "--expert-model-parallel-size 8 " "--expert-tensor-parallel-size 1 "
+
+
 def _get_parallel_config(args: ScriptArgs) -> str:
     """Return parallel config args for tested GPU configurations.
 
@@ -277,20 +502,24 @@ def _get_parallel_config(args: ScriptArgs) -> str:
         )
 
     if actor_num_gpus_per_node == 8:
-        if total_gpus == 32:  # 4 nodes x 8 GPUs (MI355X, full Flash): TP4/PP4/EP8, 43 layers = 11+11+11+10
-            return (
-                "--tensor-model-parallel-size 4 "
-                "--sequence-parallel "
-                "--pipeline-model-parallel-size 4 "
-                "--decoder-first-pipeline-num-layers 11 "
-                "--decoder-last-pipeline-num-layers 10 "
-                "--context-parallel-size 1 "
-                # Raising context parallelism also needs --allgather-cp: DeepSeek V4 has no
-                # zigzag CP path, and arguments.py asserts on the flag rather than setting it.
-                # "--allgather-cp "
-                "--expert-model-parallel-size 8 "
-                "--expert-tensor-parallel-size 1 "
-            )
+        cp_size = args.context_parallel_size
+        if total_gpus == 32:  # 4 nodes x 8 GPUs: PP4/EP8, 43 layers = 11+11+11+10
+            if cp_size == 1:
+                # The original layout, kept verbatim: TP4/PP4/CP1/EP8, DP2.
+                return (
+                    "--tensor-model-parallel-size 4 "
+                    "--sequence-parallel "
+                    "--pipeline-model-parallel-size 4 "
+                    "--decoder-first-pipeline-num-layers 11 "
+                    "--decoder-last-pipeline-num-layers 10 "
+                    "--context-parallel-size 1 "
+                    "--expert-model-parallel-size 8 "
+                    "--expert-tensor-parallel-size 1 "
+                )
+            return _cp_derived_layout(total_gpus, pipeline_size=4, first_layers=11, last_layers=10, cp_size=cp_size)
+
+        if total_gpus == 16:  # 2 nodes x 8 GPUs: PP2/EP8, 43 layers = 22+21
+            return _cp_derived_layout(total_gpus, pipeline_size=2, first_layers=22, last_layers=21, cp_size=cp_size)
 
     raise NotImplementedError(
         f"No pre-set parallel config for {total_gpus} GPUs. "
@@ -298,8 +527,76 @@ def _get_parallel_config(args: ScriptArgs) -> str:
     )
 
 
-def _train(args: ScriptArgs):
+@dataclass(frozen=True)
+class _FP8Capabilities:
+    device: str
+    te_version: str
+    blockwise: tuple[bool, str]
+    tensorwise: tuple[bool, str]
+
+
+def _probe_fp8_capabilities() -> _FP8Capabilities:
+    # TE is optional for download/conversion and importing launchers on CPU CI.
+    # Probe only when training is requested, before any Ray jobs are submitted.
+    try:
+        import torch
+        import transformer_engine
+        from transformer_engine.common import recipe
+        from transformer_engine.pytorch import fp8
+    except ImportError as exc:
+        raise RuntimeError("FP8 training requires Transformer Engine with FP8 recipe support.") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("FP8 recipe preflight requires a visible training GPU; cannot verify TE capabilities.")
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    device = f"{props.name} ({getattr(props, 'gcnArchName', 'CUDA')})"
+
+    def support(class_name, check_name):
+        check = getattr(fp8, check_name, None)
+        if not hasattr(recipe, class_name) or check is None:
+            return False, f"TE lacks {class_name} / {check_name}"
+        return check()
+
+    return _FP8Capabilities(
+        device=device,
+        te_version=transformer_engine.__version__,
+        blockwise=support("Float8BlockScaling", "check_fp8_block_scaling_support"),
+        tensorwise=support("Float8CurrentScaling", "check_fp8_support"),
+    )
+
+
+def _resolve_fp8_recipe(requested: str) -> str:
+    if requested not in ("auto", "blockwise", "tensorwise"):
+        raise ValueError(f"Unknown FP8 recipe: {requested}")
+    caps = _probe_fp8_capabilities()
+    candidates = ("blockwise", "tensorwise") if requested == "auto" else (requested,)
+    for candidate in candidates:
+        if getattr(caps, candidate)[0]:
+            print(
+                f"[precision] FP8 E4M3 requested={requested} selected={candidate}; "
+                f"TE={caps.te_version}; device={caps.device}; blockwise_support={caps.blockwise}"
+            )
+            return candidate
+    raise RuntimeError(
+        f"FP8 recipe '{requested}' is unsupported on {caps.device} (TE {caps.te_version}). "
+        f"blockwise: {caps.blockwise[1]}; tensorwise: {caps.tensorwise[1]}. "
+        "Use --fp8-recipe auto or --fp8-recipe tensorwise on a supported TE build. "
+        "No BF16 fallback was applied."
+    )
+
+
+def _get_fp8_training_recipe(args: ScriptArgs) -> str | None:
+    if not args.fp8_training:
+        return None
+    if any(token.split("=", 1)[0] == "--fp8-recipe" for token in shlex.split(args.extra_args)):
+        raise ValueError("Set the launcher's --fp8-recipe, not --extra-args, so TE support is checked.")
+    return _resolve_fp8_recipe(args.fp8_recipe)
+
+
+def _train(args: ScriptArgs, *, fp8_recipe: str | None = None):
     print(f"[precision] fp8_training={args.fp8_training}")
+    if fp8_recipe is None:
+        fp8_recipe = _get_fp8_training_recipe(args)
     print(
         f"running on {args.num_nodes} nodes "
         f"({args.actor_num_nodes} actor nodes x {args.actor_num_gpus_per_node} GPUs/node, "
@@ -308,29 +605,40 @@ def _train(args: ScriptArgs):
     _ensure_4layer_model_type(args)
 
     load_save_path = f"{args.save_dir}/{args.run_id}/checkpoints"
-    ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} " f"--ref-load {args.model_local_dir}/{args.torch_dist_name} "
+    ckpt_args = (
+        f"--hf-checkpoint {_hf_checkpoint_path(args)} " f"--ref-load {args.model_local_dir}/{args.torch_dist_name} "
+    )
     if not args.skip_saving:
         ckpt_args += (
             f"--load {load_save_path} " f"--save {load_save_path} " "--save-interval 20 " "--save-retain-interval 20 "
         )
 
+    fp8_smoke = args.profile == "fp8_smoke"
     rollout_args = (
         "--label-key label "
         "--apply-chat-template "
         "--rollout-shuffle "
-        "--rm-type math "
         "--num-rollout 3000 "
-        "--rollout-batch-size 32 "
-        "--n-samples-per-prompt 8 "
+        f"--rollout-batch-size {2 if fp8_smoke else 32} "
+        f"--n-samples-per-prompt {4 if fp8_smoke else 8} "
         "--rollout-temperature 0.8 "
         "--num-steps-per-rollout 1 "
         "--balance-data "
     )
 
-    if args.mode != "debug_minimal":
+    if args.mode != "debug_minimal" and not fp8_smoke:
         rollout_args += (
-            "--over-sampling-batch-size 512 "
+            f"--over-sampling-batch-size {2 if fp8_smoke else 512} "
             "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
+        )
+    if fp8_smoke:
+        # The modern rollout pipeline does not enforce these per-rollout budgets.
+        rollout_args += (
+            "--rollout-function-path miles.rollout.sglang_rollout.generate_rollout "
+            "--over-sampling-batch-size 8 --rollout-max-candidate-groups 32 --rollout-timeout-seconds 1800 "
+            "--continuous-rollout "
+            "--dynamic-sampling-filter-path "
+            "miles.rollout.filter_hub.truncated_response_filters.mask_truncated_and_require_completed_reward_diversity "
         )
 
     eval_args = ""
@@ -340,10 +648,19 @@ def _train(args: ScriptArgs):
     match args.task:
         case "dapo_aime":
             rollout_args += (
+                # DAPO prompts explicitly request "Answer:", not LaTeX boxed.
+                # The math grader only extracts boxed answers and silently
+                # yields all-zero rewards on otherwise-correct completions.
+                f"--rm-type {'dapo_strict' if fp8_smoke else 'dapo'} --reward-key score "
+                f"--eval-reward-key {'acc' if fp8_smoke else 'score'} "
                 f"--prompt-data {args.data_dir}/dapo-math-17k/dapo-math-17k.jsonl "
                 "--input-key prompt "
-                f"--rollout-max-response-len 8192 "
-                """--apply-chat-template-kwargs '{"thinking_mode":"thinking"}' """
+                f"--rollout-max-response-len {2048 if fp8_smoke else 8192} "
+                + (
+                    """--apply-chat-template-kwargs '{"thinking_mode":"chat"}' """
+                    if fp8_smoke
+                    else """--apply-chat-template-kwargs '{"thinking_mode":"thinking"}' """
+                )
             )
             eval_args += (
                 f"--eval-prompt-data aime {args.data_dir}/aime-2024/aime-2024.jsonl "
@@ -352,6 +669,7 @@ def _train(args: ScriptArgs):
             )
         case "gsm8k":
             rollout_args += (
+                "--rm-type math "
                 f"--prompt-data {args.data_dir}/gsm8k/train.parquet "
                 "--input-key messages "
                 "--rollout-max-response-len 256 "
@@ -393,10 +711,21 @@ def _train(args: ScriptArgs):
         optimizer_args += (
             "--optimizer-cpu-offload " "--use-precision-aware-optimizer " "--overlap-cpu-optimizer-d2h-h2d "
         )
-        if args.actor_num_nodes == 4:
-            # 4-node PP4 memory balance: partial optimizer offload (keep ~25% on GPU) + keep train
-            # weights on GPU; pair with --sglang-mem-fraction-static 0.5.
-            optimizer_args += "--optimizer-offload-fraction 0.75 " "--no-offload-train "
+        if fp8_smoke:
+            # HDO keeps FP32 masters/moments. Stream gradients rather than
+            # holding a full FP32 CPU gradient copy alongside both moments.
+            optimizer_args += (
+                "--optimizer-offload-fraction 1.0 --offload-train "
+                "--optimizer-cpu-streaming-gradients --no-pin-cpu-grads --no-pin-cpu-params "
+                "--rematerialize-param-from-master-weight --check-rematerialize-param-from-master-weight "
+            )
+        elif args.actor_num_nodes == 4:
+            if _resolve_colocate_memory_profile(args) == "288gb":
+                # 288 GB card: partial optimizer offload (keep ~25% on GPU) + keep train
+                # weights on GPU; pair with --sglang-mem-fraction-static 0.5.
+                optimizer_args += "--optimizer-offload-fraction 0.75 " "--no-offload-train "
+            else:
+                optimizer_args += "--optimizer-offload-fraction 1.0 " "--offload-train "
 
     sglang_world_size = 4
     sglang_tp_size = 4
@@ -410,8 +739,25 @@ def _train(args: ScriptArgs):
         "--router-health-success-threshold 1 "
         "--router-health-check-interval-secs 15 "
         "--router-health-failure-threshold 40 "  # TODO improve
+        # Small GRPO batches share prefixes; cache-aware routing's default
+        # imbalance threshold (64) can queue the whole batch on one engine.
+        "--sglang-router-policy round_robin"
     )
+    if fp8_smoke:
+        perf_args += "--dsv4-kv-qat off --dsv4-index-qat fp8_dynamic "
+        sglang_args += (
+            " --sglang-context-length 4096 --sglang-max-total-tokens 32768 "
+            "--sglang-chunked-prefill-size 2048 --sglang-max-running-requests 8 "
+            "--sglang-kv-cache-dtype bfloat16 "
+            "--sglang-cuda-graph-backend-decode disabled --sglang-cuda-graph-backend-prefill disabled "
+        )
+    if _is_gfx942():
+        # gfx942: AITER's BF16 atomic reductions perturb router/expert results
+        # between identical forwards. Triton still executes FP8 expert GEMMs.
+        sglang_args += " --sglang-moe-runner-backend triton --sglang-disable-custom-all-reduce "
     extra_env_vars = {
+        "TORCHINDUCTOR_MAX_AUTOTUNE": "0",
+        "TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE": "0",
         "SGLANG_SKIP_CHECKPOINT_LOAD_CHECK": "1",
         "SGLANG_DSV4_FP4_EXPERTS": "0",
         "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
@@ -424,6 +770,10 @@ def _train(args: ScriptArgs):
         "SGLANG_HEALTH_CHECK_TIMEOUT": "120",
         "AITER_BF16_FP8_MOE_BOUND": "0",
     }
+    if _is_gfx942():
+        # Bound per-process hardware queues in colocated training/serving.
+        # Keep all overrides in the Ray runtime env, never host configuration.
+        extra_env_vars |= {"GPU_MAX_HW_QUEUES": "1", "SGLANG_SET_CPU_AFFINITY": "0"}
 
     misc_args = (
         "--attention-dropout 0.0 "
@@ -433,8 +783,8 @@ def _train(args: ScriptArgs):
         f"--actor-num-nodes {args.actor_num_nodes} "
         f"--actor-num-gpus-per-node {args.actor_num_gpus_per_node} "
         f"--num-gpus-per-node {args.num_gpus_per_node} "
-        "--train-memory-margin-bytes 3221225472 "
-        "--sglang-mem-fraction-static 0.5 "
+        f"--train-memory-margin-bytes {'3221225472' if _resolve_colocate_memory_profile(args) == '288gb' else '1073741824'} "
+        f"--sglang-mem-fraction-static {'0.5' if _resolve_colocate_memory_profile(args) == '288gb' else '0.85'} "
         "--sglang-watchdog-timeout 1800 "  # ROCm: slow aiter gemm tune under colocate; avoid watchdog SIGQUIT
         "--accumulate-allreduce-grads-in-fp32 "
         "--dsv4-impl miles "  # ROCm has no cudnn/flash_mla path for the megatron impl
@@ -445,6 +795,8 @@ def _train(args: ScriptArgs):
         "--rollout-health-check-interval 300 "
         "--rollout-health-check-timeout 300 "
     )
+    if fp8_smoke:
+        misc_args += "--moe-router-dtype fp32 "
     if args.colocate:
         misc_args += "--colocate "
     else:
@@ -486,8 +838,11 @@ def _train(args: ScriptArgs):
         }
 
     if args.fp8_training:
-        misc_args += "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " "--fp8-recipe blockwise "
-        misc_args += """--train-env-vars '{"NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"0"}' """
+        misc_args += (
+            "--transformer-impl transformer_engine " "--bf16 " "--fp8-format e4m3 " f"--fp8-recipe {fp8_recipe} "
+        )
+        if fp8_recipe == "blockwise":
+            misc_args += """--train-env-vars '{"NVTE_FP8_BLOCK_SCALING_FP32_SCALES":"0"}' """
         # ROCm TE MoE FP8 lacks fused wgrad accumulation; disable the fusion.
         misc_args += "--no-gradient-accumulation-fusion "
 
@@ -521,6 +876,18 @@ def _train(args: ScriptArgs):
         megatron_model_type=args.megatron_model_type,
         extra_env_vars={**extra_env_vars},
         megatron_path=args.megatron_path,
+        before_ray_job_submit=(
+            (
+                lambda: U.ssh_start_ray_workers(
+                    master_addr=os.environ.get("MASTER_ADDR", "127.0.0.1"),
+                    num_gpus_per_node=args.num_gpus_per_node,
+                    hostfile=args.ray_hostfile,
+                    port=args.ray_port,
+                )
+            )
+            if args.join_ray_workers and args.num_nodes > 1
+            else None
+        ),
     )
 
 
@@ -534,6 +901,7 @@ def train(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def full_train(args: ScriptArgs):
+    fp8_recipe = _get_fp8_training_recipe(args)
     _prepare_download(args)
 
     bf16_dir = Path(f"{args.model_dir}/{args.bf16_name}")
@@ -558,7 +926,7 @@ def full_train(args: ScriptArgs):
     if args.hf_checkpoint is None:
         args.hf_checkpoint = f"{args.model_local_dir}/{args.model_name}"
 
-    _train(args)
+    _train(args, fp8_recipe=fp8_recipe)
 
 
 if __name__ == "__main__":
