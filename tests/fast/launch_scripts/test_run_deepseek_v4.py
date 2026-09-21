@@ -676,3 +676,29 @@ def test_a_single_node_is_left_alone(monkeypatch, amd_launcher, tmp_path):
     assert "--optimizer-offload-fraction" not in command
     for flag in _TWO_NODE_OFFLOAD_FLAGS:
         assert flag not in command, flag
+
+
+@pytest.mark.parametrize(
+    ("memory_profile", "expected_fraction", "expected_train_flag"),
+    [("192gb", "1.0", "--offload-train"), ("288gb", "0.75", "--no-offload-train")],
+)
+def test_four_nodes_keep_their_own_arm(
+    monkeypatch, amd_launcher, tmp_path, memory_profile, expected_fraction, expected_train_flag
+):
+    """Widening the first arm to two nodes must leave the four-node recipe untouched.
+
+    Before, four nodes reached the `elif` because fp8_smoke pins num_nodes=2 and so was
+    always False there; after, because `actor_num_nodes == 2` is False. Same arm either way.
+    """
+    _set_capabilities(monkeypatch, amd_launcher)
+    # the fixture pins the probe to 192gb so tests do not depend on a real device
+    monkeypatch.setattr(amd_launcher, "_resolve_colocate_memory_profile", lambda args: memory_profile)
+    recording = install_command_recorder(monkeypatch)
+    call_entrypoint(amd_launcher, "train", {"num_nodes": 4}, sandbox=tmp_path)
+    command = recording.commands[-1]
+
+    assert f"--optimizer-offload-fraction {expected_fraction}" in command
+    assert expected_train_flag in command
+    # the two-node-only knobs must not leak into the four-node recipe
+    assert "--optimizer-cpu-streaming-gradients" not in command
+    assert "--rematerialize-param-from-master-weight" not in command
