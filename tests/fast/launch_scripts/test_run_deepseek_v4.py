@@ -637,3 +637,42 @@ def test_amd_extra_args_cannot_bypass_recipe_preflight(monkeypatch, amd_launcher
     with pytest.raises(ValueError, match="not --extra-args"):
         call_entrypoint(amd_launcher, "train", {"extra_args": extra_args}, sandbox=tmp_path)
     assert not recording.commands
+
+
+_TWO_NODE_OFFLOAD_FLAGS = (
+    "--offload-train",
+    "--optimizer-cpu-streaming-gradients",
+    "--no-pin-cpu-grads",
+    "--no-pin-cpu-params",
+    "--rematerialize-param-from-master-weight",
+    "--check-rematerialize-param-from-master-weight",
+)
+
+
+def test_two_actor_nodes_get_the_offload_recipe_without_the_smoke_profile(monkeypatch, amd_launcher, tmp_path):
+    """291B colocated on 2 x 8 x 192 GB has to offload whichever recipe is running.
+
+    These settings used to live behind ``--profile fp8_smoke``, so at two nodes the
+    default profile fell through both arms of the chain and emitted no
+    ``--offload-train`` at all -- the engine then died during load.
+    """
+    _set_capabilities(monkeypatch, amd_launcher)
+    recording = install_command_recorder(monkeypatch)
+    call_entrypoint(amd_launcher, "train", {"num_nodes": 2}, sandbox=tmp_path)
+    command = recording.commands[-1]
+
+    assert "--optimizer-offload-fraction 1.0" in command
+    for flag in _TWO_NODE_OFFLOAD_FLAGS:
+        assert flag in command, flag
+
+
+def test_a_single_node_is_left_alone(monkeypatch, amd_launcher, tmp_path):
+    """The chain is keyed on the topology, so widening it must not reach one node."""
+    _set_capabilities(monkeypatch, amd_launcher)
+    recording = install_command_recorder(monkeypatch)
+    call_entrypoint(amd_launcher, "train", {"num_nodes": 1}, sandbox=tmp_path)
+    command = recording.commands[-1]
+
+    assert "--optimizer-offload-fraction" not in command
+    for flag in _TWO_NODE_OFFLOAD_FLAGS:
+        assert flag not in command, flag

@@ -733,9 +733,16 @@ def _train(args: ScriptArgs, *, fp8_recipe: str | None = None):
         optimizer_args += (
             "--optimizer-cpu-offload " "--use-precision-aware-optimizer " "--overlap-cpu-optimizer-d2h-h2d "
         )
-        if fp8_smoke:
+        if args.actor_num_nodes == 2:
             # HDO keeps FP32 masters/moments. Stream gradients rather than
             # holding a full FP32 CPU gradient copy alongside both moments.
+            #
+            # Keyed on the topology, not on --profile: at two actor nodes the model has
+            # to offload regardless of which recipe is running. These values are the ones
+            # validated on a 2 x 8 x 192 GB gfx942 pair (28 rollouts, all 16 ranks steady
+            # at mem usage=75.04 GB). They are deliberately applied for any 192/288 GB
+            # card here -- on a larger card they are more conservative than necessary,
+            # which costs throughput but cannot run the GPU out of memory.
             optimizer_args += (
                 "--optimizer-offload-fraction 1.0 --offload-train "
                 "--optimizer-cpu-streaming-gradients --no-pin-cpu-grads --no-pin-cpu-params "
