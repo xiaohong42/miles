@@ -108,9 +108,12 @@ class SGLangApiClient:
             idempotent: True when replaying the request after the server may already have
                 executed it is harmless. Defaults to False so that an endpoint which was
                 never reviewed for replay safety keeps the conservative behaviour.
-            retry_seconds: Total wall-clock budget for retries, or None to disable retrying
-                entirely. Use None for best-effort calls whose caller treats failure as an
-                expected outcome, so that failing stays fast.
+            retry_seconds: How long after the first attempt a failed attempt may still be
+                retried, or None to disable retrying entirely. It does not bound an attempt
+                that is still waiting for a response: the shared client has no read timeout,
+                so a hung request is only ended by the server or the connection. Use None for
+                best-effort calls whose caller treats failure as an expected outcome, so that
+                failing stays fast.
 
         Returns:
             The JSON response from the server
@@ -352,8 +355,9 @@ class SGLangApiClient:
         if skip_list is not None:
             # sglang's CheckWeightsReqInput names this field `skip_tensor_list`.
             payload["skip_tensor_list"] = skip_list
-        # Read-only checksum/compare.
-        return await self._make_request("weights_checker", payload, idempotent=True)
+        # checksum reads and snapshot rewrites the same copy, so both replay safely. compare
+        # consumes the snapshot (a replay asserts on it) and reset_tensors draws new values.
+        return await self._make_request("weights_checker", payload, idempotent=action in ("checksum", "snapshot"))
 
     async def pull_weights(self, target_version: int, local_checkpoint_dir: str, source_dir: str):
         """Have the engine sync every host it spans to target_version: each host pulls the
@@ -443,17 +447,12 @@ class SGLangApiClient:
         )
 
     async def pause_generation(self, mode: str = "retract"):
-        response = await GeneralHttpClientProvider.client().post(
-            f"{self.server_url}/pause_generation",
-            json={"mode": mode},
-        )
-        response.raise_for_status()
-        return response
+        # Opens every weight-update session, so it gets the same connect-phase retry as the
+        # transfer it guards. Not declared idempotent: a second pause lands on paused state.
+        return await self._make_request("pause_generation", {"mode": mode})
 
     async def continue_generation(self):
-        response = await GeneralHttpClientProvider.client().post(f"{self.server_url}/continue_generation", json={})
-        response.raise_for_status()
-        return response
+        return await self._make_request("continue_generation", {})
 
     async def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session on the engine. sync_base=False declares an
