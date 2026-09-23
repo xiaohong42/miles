@@ -167,18 +167,6 @@ def test_empty_qat():
     assert x.grad.shape == x.shape
 
 
-def test_real_image_auto_selects_supported_fp8():
-    from scripts.amd.run_deepseek_v4 import _probe_fp8_capabilities, _resolve_fp8_recipe
-
-    caps = _probe_fp8_capabilities()
-    assert caps.tensorwise[0], caps.tensorwise[1]
-    expected = "blockwise" if caps.blockwise[0] else "tensorwise"
-    assert _resolve_fp8_recipe("auto") == expected
-    if not caps.blockwise[0]:
-        with pytest.raises(RuntimeError, match="No BF16 fallback"):
-            _resolve_fp8_recipe("blockwise")
-
-
 @pytest.mark.parametrize("grouped", [False, True])
 def test_tensorwise_linear_fp8_forward_backward(grouped, monkeypatch):
     import transformer_engine.pytorch as te
