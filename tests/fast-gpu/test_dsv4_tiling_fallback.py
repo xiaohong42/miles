@@ -8,6 +8,11 @@ import inspect
 
 import pytest
 
+from tests.ci.ci_register import register_rocm_ci
+
+# tilelang ships only in the GPU images; under tests/fast/ the CPU stage skipped every case here.
+register_rocm_ci(est_time=60, suite="stage-c-4-gpu-mi350", labels=["miles-plugin"])
+
 tilelang = pytest.importorskip("tilelang", reason="the DeepSeek-V4 kernels are tilelang modules")
 
 from miles_plugins.models.deepseek_v4.ops.kernel import tilelang_indexer_fwd as indexer_fwd  # noqa: E402
