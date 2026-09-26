@@ -146,6 +146,25 @@ RUN cd /sgl-workspace/sglang && \
     fi && \
     pip install -e "python[all_hip]" --no-deps
 
+# The base image compiled sgl_kernel's AOT extension from its own sglang revision, and the editable
+# install above only reinstalls the Python package, so an AOT kernel fix on SGLANG_BRANCH never
+# reaches the binary that runs. Rebuild it from this checkout. The build hipifies in place and the
+# .cu sources include ../../../jit/include, so it runs in a copy of kernels/ that keeps that layout.
+# easy-install.pth lists eggs in install order and the first one wins, so the base's egg goes first.
+ARG REBUILD_SGL_KERNEL=1
+RUN if [ "${REBUILD_SGL_KERNEL}" = "1" ]; then \
+      sp="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+      (pip uninstall -y sglang-kernel || true) && \
+      if [ -f "$sp/easy-install.pth" ]; then sed -i '\#^\./sglang_kernel-.*\.egg$#d' "$sp/easy-install.pth"; fi && \
+      rm -rf "$sp"/sglang_kernel-*.egg && \
+      mkdir -p /tmp/sgl-aot/python/sglang && \
+      cp -r /sgl-workspace/sglang/python/sglang/kernels /tmp/sgl-aot/python/sglang/ && \
+      cd /tmp/sgl-aot/python/sglang/kernels/aot && \
+      rm -rf build dist ./*.egg-info && cp pyproject_rocm.toml pyproject.toml && \
+      AMDGPU_TARGET=${GPU_ARCH} python setup_rocm.py install && \
+      cd / && rm -rf /tmp/sgl-aot; \
+    fi
+
 # SGLang is installed without dependencies, but its Inkling multimodal processor imports numba.
 RUN pip install "numba==0.65.1"
 
